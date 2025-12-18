@@ -213,6 +213,7 @@ void HandleMouseDrag(bool is_left_button_down, int current_y)
         double chart_max = ChartGetDouble(0, CHART_FIXED_MAX);
         double chart_min = ChartGetDouble(0, CHART_FIXED_MIN);
 
+
         //--- Calculate how much the mouse has moved vertically
         int y_diff = current_y - g_last_mouse_y;
         
