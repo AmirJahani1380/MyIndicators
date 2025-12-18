@@ -1,40 +1,57 @@
 //+------------------------------------------------------------------+
-//|                                                   SDZones_Shell  |
-//|   Step 3: Base detection (1..6 basing candles + optional patterns)|
-//|   Keeps Step 1 TEST zone + Step 2 candle helpers + debug bases    |
+//|                                                   AlfonsoZones   |
+//|   Step 5 (revised): Filled zones + proper confirmation            |
+//|   - Filled rectangles (single OBJ_RECTANGLE per zone)             |
+//|   - Zone color affects both border & fill                         |
+//|   - Confirmed zones: potential zone that takes out opposing zone  |
+//|     (checks leg-out move, not just one candle)                    |
+//|   - Processes zones oldest->newest for correct confirmation       |
 //+------------------------------------------------------------------+
 #property strict
 #property indicator_chart_window
 
-// Dummy plot to avoid "no indicator plot defined"
 #property indicator_plots   1
 #property indicator_buffers 1
 #property indicator_type1   DRAW_NONE
 #property indicator_label1  ""
 
 //------------------------- Inputs -----------------------------------
-input int    InpLookbackBars      = 2000;   // Only check within this window
-input bool   InpDebug             = true;   // Print debug logs
-input string InpObjPrefix         = "SDZ_"; // Objects prefix (cleanup safety)
+input int    InpLookbackBars      = 2000;
+input bool   InpDebug             = true;
+input string InpObjPrefix         = "SDZ_";
 
-// Step 2 thresholds
-input double InpBasingBodyPctMax  = 0.50;   // basing if body/range <= 50%
-input double InpERCBodyPctMin     = 0.60;   // ERC if body/range >= 60%
-input double InpCloseNearPct      = 0.20;   // close near hi/lo if within 20% of range
-input int    InpAvgRangeLen       = 20;     // for "wide" check
-input double InpWideMult          = 1.50;   // wide if range >= avgRange * mult
-input bool   InpMarkDebugBars     = false;  // optional on-chart markers
-input int    InpMarkBarsCount     = 50;     // how many recent closed bars to mark
+// Candle classification thresholds
+input double InpBasingBodyPctMax  = 0.50;
+input double InpERCBodyPctMin     = 0.60;
+input double InpCloseNearPct      = 0.20;
+input int    InpAvgRangeLen       = 20;
+input double InpWideMult          = 1.50;
 
-// Step 3 base rules
-input int    InpBaseMinBars               = 1;   // base min candles
-input int    InpBaseMaxBars               = 6;   // base max candles
+// Base rules
+input int    InpBaseMinBars               = 1;
+input int    InpBaseMaxBars               = 6;     // STRICT: >max => reject (no truncation)
 input bool   InpAllowSingleCandleBase     = true;
 input bool   InpBaseUseEngulfPierceHarami = true;
 
-// Step 3 debug drawing
-input int    InpScanLegOutBars    = 200;  // scan last N closed bars for impulses
-input int    InpMaxDebugBases     = 20;   // max base rectangles drawn
+// Detection + confirmation
+input int    InpScanPatternBars        = 800;  // scan last N closed bars for leg-outs
+input int    InpMaxZonesProcess        = 120;  // cap new zones processed per bar
+input int    InpConfirmLookaheadBars   = 30;   // leg-out "move": scan forward up to N candles to take out opposing zone
+
+// Display
+input bool   InpDrawZones        = true;
+input bool   InpShowEliminated   = true;
+
+// Colors (your defaults)
+input color  InpPotentialDemandColor = clrMintCream;
+input color  InpPotentialSupplyColor = clrLavenderBlush;
+input color  InpEliminatedColor      = clrOrangeRed;
+input color  InpConfirmedColor       = clrMidnightBlue;
+
+// Border widths
+input int    InpWidthPotential   = 1;
+input int    InpWidthConfirmed   = 2;
+input int    InpWidthEliminated  = 1;
 
 //------------------------- Types ------------------------------------
 enum ZoneType   { Demand = 0, Supply = 1 };
@@ -45,33 +62,34 @@ struct Zone
    ZoneType   type;
    ZoneStatus status;
 
+   int        legIn;
    int        baseStart;
    int        baseEnd;
+   int        legOut;
 
    double     proximal;
    double     distal;
 
-   datetime   tStart;
-   datetime   tEnd;
+   datetime   tStart;       // time[baseStart]
+   datetime   tEnd;         // now unless broken, else breaker candle time
+   datetime   tLegOut;      // time[legOut] (used for sorting / confirmation)
 
-   // Base name for the zone (we'll create 2 objects from it: _F and _B)
-   string     name;
+   string     name;         // unique object name
+   string     tag;          // DBR/RBD/RBR/DBD
 };
 
 //------------------------- Storage ----------------------------------
-Zone   zones[];
-double g_dummyBuffer[];
-datetime g_lastPrintedBarTime = 0; // to avoid log spam
+double   g_dummyBuffer[];
+datetime g_lastClosedTime = 0;
+
+Zone zonesActive[]; // Potential + Confirmed (not eliminated)
+Zone zonesDead[];   // Eliminated history
 
 //------------------------- Utilities --------------------------------
-void DebugPrint(const string msg)
-{
-   if(InpDebug) Print(msg);
-}
+void DebugPrint(const string msg){ if(InpDebug) Print(msg); }
 
 string MakeBasePrefix()
 {
-   // Prefix + Symbol + "_" + Period + "_" + uniqueId
    return (InpObjPrefix + _Symbol + "_" + IntegerToString((int)_Period) + "_");
 }
 
@@ -83,12 +101,30 @@ bool StartsWith(const string s, const string prefix)
    return (StringSubstr(s, 0, plen) == prefix);
 }
 
+void DeleteObjectsByPrefix(const string pfx)
+{
+   const long chart_id = 0;
+   int total = ObjectsTotal(chart_id);
+   for(int i = total - 1; i >= 0; --i)
+   {
+      string nm = ObjectName(chart_id, i);
+      if(StartsWith(nm, pfx))
+         ObjectDelete(chart_id, nm);
+   }
+}
+
+void DeleteObjectExact(const string name)
+{
+   const long chart_id = 0;
+   if(ObjectFind(chart_id, name) >= 0)
+      ObjectDelete(chart_id, name);
+}
+
 //------------------------- Indexing helpers --------------------------
-// In OnCalculate, arrays may be "series" (newest at 0) or chronological (oldest at 0).
 bool IsSeriesOrder(const datetime &time[], const int rates_total)
 {
    if(rates_total < 2) return true;
-   return (time[0] > time[rates_total - 1]);
+   return (time[0] > time[rates_total - 1]); // series => newest at [0]
 }
 
 int IndexCurrentBar(const datetime &time[], const int rates_total)
@@ -101,7 +137,6 @@ int IndexLastClosedBar(const datetime &time[], const int rates_total)
    return IsSeriesOrder(time, rates_total) ? 1 : (rates_total - 2);
 }
 
-// Compute lookback window bounds [winOldest .. winNewest] in array index space.
 bool ComputeWindow(const datetime &time[], const int rates_total, const int lookback,
                    int &winOldest, int &winNewest)
 {
@@ -112,16 +147,15 @@ bool ComputeWindow(const datetime &time[], const int rates_total, const int look
    if(lb > rates_total) lb = rates_total;
 
    bool series = IsSeriesOrder(time, rates_total);
-
    if(series)
    {
       winNewest = 0;
-      winOldest = lb - 1;                 // include [0 .. lb-1]
+      winOldest = lb - 1;               // [0..lb-1]
    }
    else
    {
       winNewest = rates_total - 1;
-      winOldest = rates_total - lb;       // include [rates_total-lb .. rates_total-1]
+      winOldest = rates_total - lb;     // [rates_total-lb .. rates_total-1]
       if(winOldest < 0) winOldest = 0;
    }
    return true;
@@ -129,112 +163,14 @@ bool ComputeWindow(const datetime &time[], const int rates_total, const int look
 
 bool IndexInWindow(const int idx, const int winOldest, const int winNewest, const bool series)
 {
-   if(series)
-      return (idx >= winNewest && idx <= winOldest);
-   else
-      return (idx >= winOldest && idx <= winNewest);
+   if(series) return (idx >= winNewest && idx <= winOldest);
+   return (idx >= winOldest && idx <= winNewest);
 }
 
-// Get an "older" index offset by k bars from idx
-int OlderIndex(const int idx, const int k, const bool series)
-{
-   return (series ? (idx + k) : (idx - k));
-}
+int OlderIndex(const int idx, const int k, const bool series){ return (series ? (idx + k) : (idx - k)); }
+int NewerIndex(const int idx, const int k, const bool series){ return (series ? (idx - k) : (idx + k)); }
 
-//------------------------- Zone API ---------------------------------
-int ZoneAdd(Zone &z)
-{
-   int n = ArraySize(zones);
-   ArrayResize(zones, n + 1);
-   zones[n] = z;
-   return n;
-}
-
-bool RectCreateOrUpdate(const string objName,
-                        const datetime t1, const double p1,
-                        const datetime t2, const double p2,
-                        const color col,
-                        const bool fill,
-                        const string description_text)
-{
-   const long chart_id = 0;
-
-   double top = MathMax(p1, p2);
-   double bot = MathMin(p1, p2);
-
-   if(MathAbs(top - bot) < (_Point * 2.0))
-      top = bot + (_Point * 10.0);
-
-   datetime tt1 = t1;
-   datetime tt2 = t2;
-   if(tt2 <= tt1)
-      tt2 = tt1 + (datetime)PeriodSeconds(_Period);
-
-   if(ObjectFind(chart_id, objName) < 0)
-   {
-      if(!ObjectCreate(chart_id, objName, OBJ_RECTANGLE, 0, tt1, top, tt2, bot))
-      {
-         if(InpDebug) PrintFormat("ObjectCreate failed for '%s'. Error=%d", objName, GetLastError());
-         return false;
-      }
-   }
-   else
-   {
-      ObjectMove(chart_id, objName, 0, tt1, top);
-      ObjectMove(chart_id, objName, 1, tt2, bot);
-   }
-
-   ObjectSetInteger(chart_id, objName, OBJPROP_COLOR, (long)col);
-   ObjectSetInteger(chart_id, objName, OBJPROP_STYLE, STYLE_SOLID);
-   ObjectSetInteger(chart_id, objName, OBJPROP_WIDTH, 1);
-
-   ObjectSetInteger(chart_id, objName, OBJPROP_BACK, true);
-   ObjectSetInteger(chart_id, objName, OBJPROP_FILL, fill);
-
-   ObjectSetInteger(chart_id, objName, OBJPROP_SELECTABLE, true);
-   ObjectSetInteger(chart_id, objName, OBJPROP_SELECTED, false);
-
-   ObjectSetString(chart_id, objName, OBJPROP_TEXT, description_text);
-
-   return true;
-}
-
-bool ZoneObjectCreateOrUpdate(const Zone &z)
-{
-   string nameFill   = z.name + "_F";
-   string nameBorder = z.name + "_B";
-
-   color base_col = (z.type == Demand ? clrLime : clrTomato);
-   color fill_col = (color)ColorToARGB(base_col, 40);
-
-   string ts   = TimeToString(z.tStart, TIME_DATE | TIME_MINUTES | TIME_SECONDS);
-   string desc = "Candle time: " + ts;
-
-   bool ok1 = RectCreateOrUpdate(nameFill,   z.tStart, z.proximal, z.tEnd, z.distal, fill_col, true,  desc);
-   bool ok2 = RectCreateOrUpdate(nameBorder, z.tStart, z.proximal, z.tEnd, z.distal, base_col, false, desc);
-
-   return (ok1 && ok2);
-}
-
-void DeleteObjectsByPrefix(const string pfx)
-{
-   const long chart_id = 0;
-   int total = ObjectsTotal(chart_id);
-   for(int i = total - 1; i >= 0; --i)
-   {
-      string name = ObjectName(chart_id, i);
-      if(StartsWith(name, pfx))
-         ObjectDelete(chart_id, name);
-   }
-}
-
-void ZonesClearAll()
-{
-   ArrayResize(zones, 0);
-   DeleteObjectsByPrefix(MakeBasePrefix());
-}
-
-//------------------------- Step 2: Candle helpers --------------------
+//------------------------- Candle helpers ----------------------------
 double CandleRange(const double &high[], const double &low[], const int i)
 {
    double r = high[i] - low[i];
@@ -253,8 +189,8 @@ double BodyPct(const double &open[], const double &high[], const double &low[], 
    return CandleBody(open, close, i) / r;
 }
 
-bool IsBull(const double &open[], const double &close[], const int i) { return close[i] > open[i]; }
-bool IsBear(const double &open[], const double &close[], const int i) { return close[i] < open[i]; }
+bool IsBull(const double &open[], const double &close[], const int i){ return close[i] > open[i]; }
+bool IsBear(const double &open[], const double &close[], const int i){ return close[i] < open[i]; }
 
 bool IsBasing(const double &open[], const double &high[], const double &low[], const double &close[], const int i)
 {
@@ -279,32 +215,24 @@ double AvgRange(const double &high[], const double &low[], const int i,
                 const int len, const bool series,
                 const int winOldest, const int winNewest)
 {
-   int L = len;
-   if(L < 1) L = 1;
-
-   double sum = 0.0;
-   int    cnt = 0;
+   int L = len; if(L < 1) L = 1;
+   double sum = 0.0; int cnt = 0;
 
    for(int k = 0; k < L; ++k)
    {
       int idx = OlderIndex(i, k, series);
-      if(!IndexInWindow(idx, winOldest, winNewest, series))
-         break;
-
+      if(!IndexInWindow(idx, winOldest, winNewest, series)) break;
       sum += CandleRange(high, low, idx);
       cnt++;
    }
-
-   if(cnt <= 0)
-      return CandleRange(high, low, i);
-
+   if(cnt <= 0) return CandleRange(high, low, i);
    return sum / (double)cnt;
 }
 
 bool IsWide(const double &high[], const double &low[], const int i,
             const bool series, const int winOldest, const int winNewest)
 {
-   double r   = CandleRange(high, low, i);
+   double r = CandleRange(high, low, i);
    double avg = AvgRange(high, low, i, InpAvgRangeLen, series, winOldest, winNewest);
    return (avg > 0.0 && r >= avg * InpWideMult);
 }
@@ -312,35 +240,33 @@ bool IsWide(const double &high[], const double &low[], const int i,
 bool IsERC(const double &open[], const double &high[], const double &low[], const double &close[], const int i,
            const bool series, const int winOldest, const int winNewest)
 {
-   if(IsBasing(open, high, low, close, i))
-      return false;
+   if(IsBasing(open, high, low, close, i)) return false;
 
    double bp = BodyPct(open, high, low, close, i);
-   if(bp < InpERCBodyPctMin)
-      return false;
+   if(bp < InpERCBodyPctMin) return false;
 
-   if(IsBull(open, close, i))
-      return CloseNearHigh(high, low, close, i);
-   if(IsBear(open, close, i))
-      return CloseNearLow(high, low, close, i);
-
+   if(IsBull(open, close, i)) return CloseNearHigh(high, low, close, i);
+   if(IsBear(open, close, i)) return CloseNearLow(high, low, close, i);
    return false;
 }
 
 bool IsFailedERC(const double &open[], const double &high[], const double &low[], const double &close[], const int i,
                  const bool series, const int winOldest, const int winNewest)
 {
-   if(!IsWide(high, low, i, series, winOldest, winNewest))
-      return false;
+   if(!IsWide(high, low, i, series, winOldest, winNewest)) return false;
    return IsBasing(open, high, low, close, i);
 }
 
-//------------------------- Step 3: Patterns --------------------------
-// These are "base helpers" only (not trade signals), so we keep them strict/simple.
+bool IsImpulse(const double &open[], const double &high[], const double &low[], const double &close[], const int i,
+               const bool series, const int winOldest, const int winNewest)
+{
+   return IsERC(open, high, low, close, i, series, winOldest, winNewest) ||
+          IsFailedERC(open, high, low, close, i, series, winOldest, winNewest);
+}
 
+//------------------------- Base pattern helpers ----------------------
 bool IsBullishEngulf(const double &open[], const double &close[], const int i, const int prev)
 {
-   // Current bull body fully engulfs previous body
    if(!(close[i] > open[i])) return false;
    double prevHi = MathMax(open[prev], close[prev]);
    double prevLo = MathMin(open[prev], close[prev]);
@@ -361,7 +287,6 @@ bool IsBearishEngulf(const double &open[], const double &close[], const int i, c
 
 bool IsHarami(const double &open[], const double &close[], const int i, const int prev)
 {
-   // Current body inside previous body
    double prevHi = MathMax(open[prev], close[prev]);
    double prevLo = MathMin(open[prev], close[prev]);
    double curHi  = MathMax(open[i], close[i]);
@@ -369,227 +294,466 @@ bool IsHarami(const double &open[], const double &close[], const int i, const in
    return (curHi <= prevHi && curLo >= prevLo);
 }
 
-bool IsPiercing(const double &open[], const double &close[], const double &high[], const double &low[], const int i, const int prev)
+//------------------------- Strict base finder ------------------------
+bool FindBaseStrictBeforeLegOut(const datetime &time[],
+                                const double &open[], const double &high[], const double &low[], const double &close[],
+                                const int legOut,
+                                const bool series,
+                                const int winOldest, const int winNewest,
+                                int &baseStart, int &baseEnd,
+                                double &proximal, double &distal,
+                                ZoneType &zoneType)
 {
-   // Typical piercing: prev bear, current bull; current opens below prev low and closes above midpoint of prev body
-   if(!(close[prev] < open[prev])) return false; // prev bear
-   if(!(close[i] > open[i]))       return false; // current bull
-
-   double prevBodyMid = (open[prev] + close[prev]) * 0.5;
-   bool openedBelow   = (open[i] < low[prev]);
-   bool closedAboveMid= (close[i] > prevBodyMid);
-   bool closedBelowPrevOpen = (close[i] < open[prev]); // classic piercing closes below prev open
-
-   return (openedBelow && closedAboveMid && closedBelowPrevOpen);
-}
-
-bool IsDarkCloud(const double &open[], const double &close[], const double &high[], const double &low[], const int i, const int prev)
-{
-   // Dark cloud cover: prev bull, current bear; current opens above prev high and closes below midpoint of prev body
-   if(!(close[prev] > open[prev])) return false; // prev bull
-   if(!(close[i] < open[i]))       return false; // current bear
-
-   double prevBodyMid = (open[prev] + close[prev]) * 0.5;
-   bool openedAbove   = (open[i] > high[prev]);
-   bool closedBelowMid= (close[i] < prevBodyMid);
-   bool closedAbovePrevOpen = (close[i] > open[prev]); // classic dark cloud closes above prev open
-
-   return (openedAbove && closedBelowMid && closedAbovePrevOpen);
-}
-
-//------------------------- Step 3: Base Finder -----------------------
-bool FindBaseBeforeLegOut(const datetime &time[],
-                          const double &open[], const double &high[], const double &low[], const double &close[],
-                          const int legOutIndex,
-                          const bool series,
-                          const int winOldest, const int winNewest,
-                          int &baseStart, int &baseEnd,
-                          double &proximal, double &distal,
-                          ZoneType &baseType,
-                          string &reason)
-{
-   reason = "";
-
-   // Determine base type from leg-out direction (temporary for base debug):
-   // bull impulse => demand base; bear impulse => supply base
-   if(IsBull(open, close, legOutIndex)) baseType = Demand;
-   else if(IsBear(open, close, legOutIndex)) baseType = Supply;
+   if(IsBull(open, close, legOut)) zoneType = Demand;
+   else if(IsBear(open, close, legOut)) zoneType = Supply;
    else return false;
 
-   int prev = OlderIndex(legOutIndex, 1, series); // candle immediately before leg-out
-   if(!IndexInWindow(prev, winOldest, winNewest, series))
-      return false;
+   int prev = OlderIndex(legOut, 1, series);
+   if(!IndexInWindow(prev, winOldest, winNewest, series)) return false;
 
-   // 1) Primary path: contiguous basing candles right before the leg-out
+   // Count contiguous basing candles before legOut
    int count = 0;
+   baseEnd = prev;
    int cur = prev;
-   baseEnd = prev; // most recent candle in the base (closest to leg-out)
-   baseStart = prev;
 
-   while(IndexInWindow(cur, winOldest, winNewest, series))
+   while(IndexInWindow(cur, winOldest, winNewest, series) && IsBasing(open, high, low, close, cur))
    {
-      if(!IsBasing(open, high, low, close, cur))
-         break;
-
       count++;
-      baseStart = cur;
-
-      if(count >= InpBaseMaxBars)
-         break;
-
-      cur = OlderIndex(cur, 1, series); // move older
+      if(count > InpBaseMaxBars) return false; // STRICT reject
+      cur = OlderIndex(cur, 1, series);
    }
 
-   if(count >= InpBaseMinBars)
+   if(count < InpBaseMinBars)
    {
-      if(count == 1 && !InpAllowSingleCandleBase)
-      {
-         // reject single-candle bases if disabled
-         return false;
-      }
+      if(!InpBaseUseEngulfPierceHarami) return false;
 
-      // Compute proximal/distal from base candles
-      double lo = low[baseStart], hi = high[baseStart];
-      double maxOC = MathMax(open[baseStart], close[baseStart]);
-      double minOC = MathMin(open[baseStart], close[baseStart]);
+      int prev2 = OlderIndex(prev, 1, series);
+      if(!IndexInWindow(prev2, winOldest, winNewest, series)) return false;
 
-      // iterate from baseStart .. baseEnd in index terms (careful with order)
-      // We'll walk forward in "newer direction" to include all candles up to baseEnd
-      int idx = baseStart;
-      while(true)
-      {
-         lo = MathMin(lo, low[idx]);
-         hi = MathMax(hi, high[idx]);
+      bool pat = IsBullishEngulf(open, close, prev, prev2) ||
+                 IsBearishEngulf(open, close, prev, prev2) ||
+                 IsHarami(open, close, prev, prev2);
 
-         maxOC = MathMax(maxOC, MathMax(open[idx], close[idx]));
-         minOC = MathMin(minOC, MathMin(open[idx], close[idx]));
+      if(!pat) return false;
+      if(2 < InpBaseMinBars || 2 > InpBaseMaxBars) return false;
 
-         if(idx == baseEnd) break;
-         idx = OlderIndex(idx, -1, series); // go newer by one
-         if(!IndexInWindow(idx, winOldest, winNewest, series))
-            break;
-      }
-
-      if(baseType == Demand)
-      {
-         distal = lo;
-         proximal = maxOC;
-      }
-      else
-      {
-         distal = hi;
-         proximal = minOC;
-      }
-
-      reason = StringFormat("BASING_%d", count);
-      return true;
-   }
-
-   // 2) Fallback: allow a 2-candle "pattern base" immediately before leg-out
-   if(!InpBaseUseEngulfPierceHarami)
-      return false;
-
-   int prev2 = OlderIndex(prev, 1, series);
-   if(!IndexInWindow(prev2, winOldest, winNewest, series))
-      return false;
-
-   bool pat = false;
-   string patName = "";
-
-   // Pattern is between prev (latest before legout) and prev2 (older)
-   if(IsBullishEngulf(open, close, prev, prev2)) { pat=true; patName="BULL_ENG"; }
-   else if(IsBearishEngulf(open, close, prev, prev2)) { pat=true; patName="BEAR_ENG"; }
-   else if(IsPiercing(open, close, high, low, prev, prev2)) { pat=true; patName="PIERCING"; }
-   else if(IsDarkCloud(open, close, high, low, prev, prev2)) { pat=true; patName="DARKCLOUD"; }
-   else if(IsHarami(open, close, prev, prev2)) { pat=true; patName="HARAMI"; }
-
-   if(!pat)
-      return false;
-
-   // Pattern base = 2 candles: [prev2 .. prev]
-   baseStart = prev2;
-   baseEnd   = prev;
-
-   // Enforce size constraints
-   if(2 < InpBaseMinBars || 2 > InpBaseMaxBars)
-      return false;
-
-   // Compute proximal/distal over these two candles
-   double lo2 = MathMin(low[baseStart], low[baseEnd]);
-   double hi2 = MathMax(high[baseStart], high[baseEnd]);
-   double maxOC2 = MathMax(MathMax(open[baseStart], close[baseStart]), MathMax(open[baseEnd], close[baseEnd]));
-   double minOC2 = MathMin(MathMin(open[baseStart], close[baseStart]), MathMin(open[baseEnd], close[baseEnd]));
-
-   if(baseType == Demand)
-   {
-      distal = lo2;
-      proximal = maxOC2;
+      baseStart = prev2;
+      baseEnd   = prev;
    }
    else
    {
-      distal = hi2;
-      proximal = minOC2;
+      if(count == 1 && !InpAllowSingleCandleBase) return false;
+      baseStart = OlderIndex(prev, (count - 1), series);
    }
 
-   reason = patName;
+   // compute prox/dist from base candles
+   double lo = low[baseStart], hi = high[baseStart];
+   double maxOC = MathMax(open[baseStart], close[baseStart]);
+   double minOC = MathMin(open[baseStart], close[baseStart]);
+
+   int idx = baseStart;
+   while(true)
+   {
+      lo = MathMin(lo, low[idx]);
+      hi = MathMax(hi, high[idx]);
+      maxOC = MathMax(maxOC, MathMax(open[idx], close[idx]));
+      minOC = MathMin(minOC, MathMin(open[idx], close[idx]));
+
+      if(idx == baseEnd) break;
+      idx = NewerIndex(idx, 1, series);
+      if(!IndexInWindow(idx, winOldest, winNewest, series)) break;
+   }
+
+   if(zoneType == Demand){ distal = lo; proximal = maxOC; }
+   else                 { distal = hi; proximal = minOC; }
+
    return true;
 }
 
-//------------------------- Debug marker helpers ----------------------
-string MakeDbgName(const datetime t)
+//------------------------- Zone build --------------------------------
+bool FindFirstBreakerAfterLegOut(const datetime &time[],
+                                 const double &high[], const double &low[],
+                                 const int legOut, const int iCls,
+                                 const bool series,
+                                 const int winOldest, const int winNewest,
+                                 const ZoneType zt,
+                                 const double distal,
+                                 int &breakerIdx)
 {
-   return MakeBasePrefix() + "DBG_" + IntegerToString((long)t);
+   breakerIdx = -1;
+
+   int idx = NewerIndex(legOut, 1, series);
+   while(IndexInWindow(idx, winOldest, winNewest, series))
+   {
+      // stop past newest closed candle
+      if(series)
+      {
+         if(idx < iCls) break;
+      }
+      else
+      {
+         if(idx > iCls) break;
+      }
+
+      if(zt == Demand)
+      {
+         if(low[idx] < distal){ breakerIdx = idx; return true; }
+      }
+      else
+      {
+         if(high[idx] > distal){ breakerIdx = idx; return true; }
+      }
+
+      if(idx == iCls) break;
+      idx = NewerIndex(idx, 1, series);
+   }
+   return false;
 }
 
-void DebugMarkerSetOrDelete(const datetime &time[], const double &high[], const double &low[],
-                            const int idx, const string text)
+bool BuildZoneFromLegOut(const datetime &time[],
+                         const double &open[], const double &high[], const double &low[], const double &close[],
+                         const int legOut,
+                         const int iCls, const int iCur,
+                         const bool series,
+                         const int winOldest, const int winNewest,
+                         Zone &outZone)
 {
-   const long chart_id = 0;
-   string name = MakeDbgName(time[idx]);
+   if(!IsImpulse(open, high, low, close, legOut, series, winOldest, winNewest))
+      return false;
 
-   if(text == "")
+   int baseStart=-1, baseEnd=-1;
+   double prox=0, dist=0;
+   ZoneType zt=Demand;
+
+   if(!FindBaseStrictBeforeLegOut(time, open, high, low, close,
+                                  legOut, series, winOldest, winNewest,
+                                  baseStart, baseEnd, prox, dist, zt))
+      return false;
+
+   int legIn = OlderIndex(baseStart, 1, series);
+   if(!IndexInWindow(legIn, winOldest, winNewest, series))
+      return false;
+
+   if(!IsImpulse(open, high, low, close, legIn, series, winOldest, winNewest))
+      return false;
+
+   bool inBull  = IsBull(open, close, legIn);
+   bool outBull = IsBull(open, close, legOut);
+
+   string tag="";
+   if(!inBull && outBull) tag="DBR";
+   else if(inBull && !outBull) tag="RBD";
+   else if(inBull && outBull) tag="RBR";
+   else if(!inBull && !outBull) tag="DBD";
+   else return false;
+
+   outZone.type      = zt;
+   outZone.status    = Potential;
+
+   outZone.legIn     = legIn;
+   outZone.baseStart = baseStart;
+   outZone.baseEnd   = baseEnd;
+   outZone.legOut    = legOut;
+
+   outZone.proximal  = prox;
+   outZone.distal    = dist;
+
+   outZone.tStart    = time[baseStart];
+   outZone.tLegOut   = time[legOut];
+   outZone.tEnd      = (datetime)(time[iCur] + PeriodSeconds(_Period)); // default extend to now
+
+   outZone.tag       = tag;
+   outZone.name      = MakeBasePrefix() + "ZONE_" + tag + "_" + IntegerToString((long)outZone.tLegOut);
+
+   // End at breaker if already broken in history
+   int breakerIdx=-1;
+   if(FindFirstBreakerAfterLegOut(time, high, low, legOut, iCls, series, winOldest, winNewest, zt, dist, breakerIdx))
    {
-      if(ObjectFind(chart_id, name) >= 0)
-         ObjectDelete(chart_id, name);
-      return;
+      outZone.status = Eliminated;
+      outZone.tEnd   = time[breakerIdx];
    }
 
-   double y = high[idx] + (CandleRange(high, low, idx) * 0.15);
-   if(y <= high[idx]) y = high[idx] + (_Point * 20.0);
+   return true;
+}
 
-   if(ObjectFind(chart_id, name) < 0)
+//------------------------- Zone list helpers -------------------------
+int FindZoneByName(const string &name, const Zone &arr[])
+{
+   int n = ArraySize(arr);
+   for(int i = 0; i < n; ++i)
+      if(arr[i].name == name)
+         return i;
+   return -1;
+}
+
+void MoveToDead(const Zone &z)
+{
+   int n = ArraySize(zonesDead);
+   ArrayResize(zonesDead, n + 1);
+   zonesDead[n] = z;
+}
+
+bool CandleTakesOutZone(const double &high[], const double &low[], const int candleIndex, const Zone &target)
+{
+   if(target.status == Eliminated) return false;
+   if(target.type == Supply) return (high[candleIndex] > target.distal);
+   return (low[candleIndex] < target.distal); // Demand
+}
+
+//------------------------- Confirmation (fixed) ----------------------
+// Confirm new zone if its LEG-OUT MOVE (legOut .. legOut+N) takes out an older opposing active zone.
+// We must process zones chronologically for this to work (done below).
+void ApplyConfirmationOnNewZone(Zone &newZ,
+                                const datetime &time[],
+                                const double &high[],
+                                const double &low[],
+                                const bool series,
+                                const int winOldest, const int winNewest,
+                                const int iCls)
+{
+   if(newZ.status == Eliminated) return;
+
+   datetime newBaseTime = newZ.tStart;
+
+   for(int i = 0; i < ArraySize(zonesActive); ++i)
    {
-      if(!ObjectCreate(chart_id, name, OBJ_TEXT, 0, time[idx], y))
+      if(zonesActive[i].status == Eliminated) continue;
+      if(zonesActive[i].type == newZ.type)    continue; // must be opposing
+      if(zonesActive[i].tStart >= newBaseTime) continue; // must pre-exist before base
+
+      // Scan forward from legOut for up to InpConfirmLookaheadBars closed candles
+      bool tookOut = false;
+      int takeIdx = -1;
+
+      for(int k = 0; k <= InpConfirmLookaheadBars; ++k)
+      {
+         int idx = NewerIndex(newZ.legOut, k, series);
+         if(!IndexInWindow(idx, winOldest, winNewest, series)) break;
+
+         // only consider up to newest closed candle
+         if(series)
+         {
+            if(idx < iCls) break;
+         }
+         else
+         {
+            if(idx > iCls) break;
+         }
+
+         if(CandleTakesOutZone(high, low, idx, zonesActive[i]))
+         {
+            tookOut = true;
+            takeIdx = idx;
+            break;
+         }
+      }
+
+      if(tookOut && takeIdx >= 0)
+      {
+         // eliminate opposing zone at the takeout candle
+         zonesActive[i].status = Eliminated;
+         zonesActive[i].tEnd   = time[takeIdx];
+
+         // confirm new zone
+         newZ.status = Confirmed;
+
+         if(InpDebug)
+         {
+            PrintFormat("CONFIRMED: %s (%s) took out %s (%s) at %s",
+                        newZ.name, newZ.tag,
+                        zonesActive[i].name, zonesActive[i].tag,
+                        TimeToString(time[takeIdx], TIME_DATE|TIME_MINUTES|TIME_SECONDS));
+         }
+         // keep scanning: one move could take out multiple opposing zones
+      }
+   }
+}
+
+void SweepEliminatedFromActive()
+{
+   for(int i = ArraySize(zonesActive) - 1; i >= 0; --i)
+   {
+      if(zonesActive[i].status == Eliminated)
+      {
+         MoveToDead(zonesActive[i]);
+         for(int j = i; j < ArraySize(zonesActive) - 1; ++j)
+            zonesActive[j] = zonesActive[j + 1];
+         ArrayResize(zonesActive, ArraySize(zonesActive) - 1);
+      }
+   }
+}
+
+// prune zones that are older than the current lookback window (so we never show before window)
+void PruneZonesOutsideWindow(const datetime oldestAllowedTime)
+{
+   // Active
+   for(int i = ArraySize(zonesActive) - 1; i >= 0; --i)
+   {
+      if(zonesActive[i].tStart < oldestAllowedTime)
+      {
+         DeleteObjectExact(zonesActive[i].name);
+         for(int j = i; j < ArraySize(zonesActive) - 1; ++j) zonesActive[j] = zonesActive[j + 1];
+         ArrayResize(zonesActive, ArraySize(zonesActive) - 1);
+      }
+   }
+   // Dead
+   for(int i = ArraySize(zonesDead) - 1; i >= 0; --i)
+   {
+      if(zonesDead[i].tStart < oldestAllowedTime)
+      {
+         DeleteObjectExact(zonesDead[i].name);
+         for(int j = i; j < ArraySize(zonesDead) - 1; ++j) zonesDead[j] = zonesDead[j + 1];
+         ArrayResize(zonesDead, ArraySize(zonesDead) - 1);
+      }
+   }
+}
+
+//------------------------- Lifecycle update --------------------------
+void UpdateZoneLifecycleOnNewClose(Zone &z,
+                                   const datetime &time[],
+                                   const double &high[], const double &low[],
+                                   const int iCls, const int iCur)
+{
+   if(z.status == Eliminated)
+      return;
+
+   // break check at newest closed candle
+   if(z.type == Demand)
+   {
+      if(low[iCls] < z.distal)
+      {
+         z.status = Eliminated;
+         z.tEnd   = time[iCls];
          return;
+      }
    }
    else
    {
-      ObjectMove(chart_id, name, 0, time[idx], y);
+      if(high[iCls] > z.distal)
+      {
+         z.status = Eliminated;
+         z.tEnd   = time[iCls];
+         return;
+      }
    }
 
-   ObjectSetString(chart_id, name, OBJPROP_TEXT, text);
-   ObjectSetInteger(chart_id, name, OBJPROP_ANCHOR, ANCHOR_CENTER);
-   ObjectSetInteger(chart_id, name, OBJPROP_BACK, true);
-   ObjectSetInteger(chart_id, name, OBJPROP_SELECTABLE, false);
+   // extend to now
+   z.tEnd = (datetime)(time[iCur] + PeriodSeconds(_Period));
+}
+
+//------------------------- Drawing (single filled rectangle) ---------
+color ZoneColorFor(const Zone &z)
+{
+   if(z.status == Eliminated) return InpEliminatedColor;
+   if(z.status == Confirmed)  return InpConfirmedColor;
+
+   // Potential by type
+   return (z.type == Demand ? InpPotentialDemandColor : InpPotentialSupplyColor);
+}
+
+int ZoneWidthFor(const Zone &z)
+{
+   if(z.status == Confirmed)  return InpWidthConfirmed;
+   if(z.status == Eliminated) return InpWidthEliminated;
+   return InpWidthPotential;
+}
+
+bool DrawZone(const Zone &z)
+{
+   if(!InpShowEliminated && z.status == Eliminated)
+   {
+      DeleteObjectExact(z.name);
+      return true;
+   }
+
+   const long chart_id = 0;
+
+   // create or update the rectangle
+   double top = MathMax(z.proximal, z.distal);
+   double bot = MathMin(z.proximal, z.distal);
+   if(MathAbs(top - bot) < (_Point * 2.0))
+      top = bot + (_Point * 10.0);
+
+   datetime t1 = z.tStart;
+   datetime t2 = z.tEnd;
+   if(t2 <= t1)
+      t2 = t1 + (datetime)PeriodSeconds(_Period);
+
+   if(ObjectFind(chart_id, z.name) < 0)
+   {
+      if(!ObjectCreate(chart_id, z.name, OBJ_RECTANGLE, 0, t1, top, t2, bot))
+      {
+         if(InpDebug) PrintFormat("ObjectCreate failed '%s' err=%d", z.name, GetLastError());
+         return false;
+      }
+   }
+   else
+   {
+      ObjectMove(chart_id, z.name, 0, t1, top);
+      ObjectMove(chart_id, z.name, 1, t2, bot);
+   }
+
+   color c = ZoneColorFor(z);
+   int w = ZoneWidthFor(z);
+
+   ObjectSetInteger(chart_id, z.name, OBJPROP_COLOR, (long)c);
+   ObjectSetInteger(chart_id, z.name, OBJPROP_STYLE, STYLE_SOLID);
+   ObjectSetInteger(chart_id, z.name, OBJPROP_WIDTH, w);
+   ObjectSetInteger(chart_id, z.name, OBJPROP_FILL, true);     // filled rectangle
+   ObjectSetInteger(chart_id, z.name, OBJPROP_BACK, true);
+
+   // description includes exact candle time for base start + legout
+   string desc =
+      z.tag + " | " +
+      (z.type==Demand ? "Demand" : "Supply") + " | " +
+      (z.status==Potential ? "Potential" : (z.status==Confirmed ? "Confirmed" : "Eliminated")) +
+      " | base: " + TimeToString(z.tStart, TIME_DATE|TIME_MINUTES|TIME_SECONDS) +
+      " | legOut: " + TimeToString(z.tLegOut, TIME_DATE|TIME_MINUTES|TIME_SECONDS) +
+      " | end: "  + TimeToString(z.tEnd, TIME_DATE|TIME_MINUTES|TIME_SECONDS);
+
+   ObjectSetString(chart_id, z.name, OBJPROP_TEXT, desc);
+
+   return true;
+}
+
+//------------------------- Sorting new zones by time (oldest->newest)
+void SortZonesByLegOutTimeAsc(Zone &arr[])
+{
+   int n = ArraySize(arr);
+   for(int i = 1; i < n; ++i)
+   {
+      Zone key = arr[i];
+      int j = i - 1;
+      while(j >= 0 && arr[j].tLegOut > key.tLegOut)
+      {
+         arr[j + 1] = arr[j];
+         j--;
+      }
+      arr[j + 1] = key;
+   }
 }
 
 //------------------------- Indicator lifecycle -----------------------
 int OnInit()
 {
-   DebugPrint("SDZones Step3: OnInit()");
-   IndicatorSetString(INDICATOR_SHORTNAME, "SDZones (Step3 Base Finder)");
+   DebugPrint("AlfonsoZones: OnInit()");
+   IndicatorSetString(INDICATOR_SHORTNAME, "AlfonsoZones (Step5)");
 
    ArraySetAsSeries(g_dummyBuffer, true);
    SetIndexBuffer(0, g_dummyBuffer, INDICATOR_DATA);
    PlotIndexSetInteger(0, PLOT_DRAW_TYPE, DRAW_NONE);
+
+   ArrayResize(zonesActive, 0);
+   ArrayResize(zonesDead, 0);
+   g_lastClosedTime = 0;
 
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
-   DebugPrint("SDZones Step3: OnDeinit()");
-   ZonesClearAll();
+   DebugPrint("AlfonsoZones: OnDeinit()");
+   DeleteObjectsByPrefix(MakeBasePrefix());
 }
 
 //------------------------- Main calculation --------------------------
@@ -606,185 +770,123 @@ int OnCalculate(
    const int &spread[]
 )
 {
-   if(rates_total < 2)
-      return 0;
-
+   if(rates_total < 2) return 0;
    g_dummyBuffer[0] = EMPTY_VALUE;
 
    const bool series = IsSeriesOrder(time, rates_total);
 
-   int winOldest = 0, winNewest = 0;
+   int winOldest=0, winNewest=0;
    if(!ComputeWindow(time, rates_total, InpLookbackBars, winOldest, winNewest))
       return rates_total;
 
    int iCur = IndexCurrentBar(time, rates_total);
    int iCls = IndexLastClosedBar(time, rates_total);
-
-   // Enforce window strictly
    if(!IndexInWindow(iCls, winOldest, winNewest, series))
-   {
-      ZonesClearAll();
-      if(InpDebug)
-         PrintFormat("Last closed bar index %d OUTSIDE window. Window=[%d..%d] series=%s",
-                     iCls, winOldest, winNewest, (series ? "true" : "false"));
       return rates_total;
-   }
 
-   // Print/compute once per new closed candle
-   bool newClosedCandle = (time[iCls] != g_lastPrintedBarTime);
-   if(newClosedCandle)
-      g_lastPrintedBarTime = time[iCls];
+   // enforce "don't draw before window"
+   datetime oldestAllowed = time[winOldest];
+   PruneZonesOutsideWindow(oldestAllowed);
 
-   // ---------- Step 2 debug harness (last closed candle) ----------
-   if(InpDebug && newClosedCandle)
+   bool newClosedBar = (time[iCls] != g_lastClosedTime);
+   if(newClosedBar) g_lastClosedTime = time[iCls];
+
+   if(newClosedBar)
    {
-      double r  = CandleRange(high, low, iCls);
-      double b  = CandleBody(open, close, iCls);
-      double bp = BodyPct(open, high, low, close, iCls);
+      // 1) Update existing active zones (break/extend) using newly closed candle
+      for(int i = ArraySize(zonesActive) - 1; i >= 0; --i)
+         UpdateZoneLifecycleOnNewClose(zonesActive[i], time, high, low, iCls, iCur);
 
-      bool basing = IsBasing(open, high, low, close, iCls);
-      bool wide   = IsWide(high, low, iCls, series, winOldest, winNewest);
-      bool cnH    = CloseNearHigh(high, low, close, iCls);
-      bool cnL    = CloseNearLow(high, low, close, iCls);
+      // Move newly eliminated to dead
+      SweepEliminatedFromActive();
 
-      bool erc    = IsERC(open, high, low, close, iCls, series, winOldest, winNewest);
-      bool ferc   = IsFailedERC(open, high, low, close, iCls, series, winOldest, winNewest);
-
-      PrintFormat("Step2 lastClosed idx=%d time=%s range=%.5f body=%.5f bodyPct=%.3f "
-                  "Bull=%s Bear=%s Basing=%s Wide=%s CloseNearH=%s CloseNearL=%s ERC=%s FailedERC=%s",
-                  iCls,
-                  TimeToString(time[iCls], TIME_DATE|TIME_MINUTES|TIME_SECONDS),
-                  r, b, bp,
-                  (IsBull(open, close, iCls) ? "true":"false"),
-                  (IsBear(open, close, iCls) ? "true":"false"),
-                  (basing ? "true":"false"),
-                  (wide   ? "true":"false"),
-                  (cnH    ? "true":"false"),
-                  (cnL    ? "true":"false"),
-                  (erc    ? "true":"false"),
-                  (ferc   ? "true":"false"));
-   }
-
-   // Optional: mark last N closed bars with B/E/F
-   if(InpMarkDebugBars && newClosedCandle)
-   {
-      int N = InpMarkBarsCount;
-      if(N < 1) N = 1;
-
-      for(int k = 0; k < N; ++k)
+      // 2) Detect new zones from scan window
+      if(InpDrawZones)
       {
-         int idx = OlderIndex(iCls, k, series);
-         if(!IndexInWindow(idx, winOldest, winNewest, series))
-            break;
+         int scan = InpScanPatternBars; if(scan < 10) scan = 10;
 
-         string tag = "";
-         if(IsERC(open, high, low, close, idx, series, winOldest, winNewest))
-            tag = "E";
-         else if(IsFailedERC(open, high, low, close, idx, series, winOldest, winNewest))
-            tag = "F";
-         else if(IsBasing(open, high, low, close, idx))
-            tag = "B";
+         Zone newFound[];
+         ArrayResize(newFound, 0);
 
-         DebugMarkerSetOrDelete(time, high, low, idx, tag);
-      }
-   }
-   else if(!InpMarkDebugBars && newClosedCandle)
-   {
-      // delete DBG_ objects only
-      DeleteObjectsByPrefix(MakeBasePrefix() + "DBG_");
-   }
-
-   // ---------- Step 3: draw debug bases for impulses ----------
-   if(newClosedCandle)
-   {
-      // Clear old base debug objects each bar so we only show the most recent set
-      DeleteObjectsByPrefix(MakeBasePrefix() + "BASE_");
-
-      int scan = InpScanLegOutBars;
-      if(scan < 5) scan = 5;
-
-      int drawn = 0;
-      for(int k = 0; k < scan && drawn < InpMaxDebugBases; ++k)
-      {
-         int leg = OlderIndex(iCls, k, series);
-         if(!IndexInWindow(leg, winOldest, winNewest, series))
-            break;
-
-         bool impulse = IsERC(open, high, low, close, leg, series, winOldest, winNewest) ||
-                        IsFailedERC(open, high, low, close, leg, series, winOldest, winNewest);
-
-         if(!impulse)
-            continue;
-
-         int baseStart = -1, baseEnd = -1;
-         double prox=0, dist=0;
-         ZoneType bt = Demand;
-         string reason = "";
-
-         if(!FindBaseBeforeLegOut(time, open, high, low, close,
-                                  leg, series, winOldest, winNewest,
-                                  baseStart, baseEnd, prox, dist, bt, reason))
-            continue;
-
-         Zone z;
-         z.type = bt;
-         z.status = Potential; // debug only
-         z.baseStart = baseStart;
-         z.baseEnd   = baseEnd;
-         z.proximal  = prox;
-         z.distal    = dist;
-
-         // left edge = baseStart time (older), right edge = extend to now for visibility
-         z.tStart = time[baseStart];
-         z.tEnd   = (datetime)(time[iCur] + PeriodSeconds(_Period));
-
-         // Name unique by leg-out time
-         long legT = (long)time[leg];
-         z.name = MakeBasePrefix() + "BASE_" + IntegerToString(legT);
-
-         // Put useful info into description text by temporarily overriding tStart text via ZoneObjectCreateOrUpdate
-         // (ZoneObjectCreateOrUpdate writes "Candle time: z.tStart", so for base debug we want base start time.
-         // We'll keep that, and also log details in Experts.)
-         if(InpDebug)
+         for(int k = 0; k < scan && ArraySize(newFound) < InpMaxZonesProcess; ++k)
          {
-            PrintFormat("BASE found: leg=%s (%s) base=[%s..%s] bars=%d type=%s reason=%s prox=%.5f dist=%.5f",
-                        TimeToString(time[leg], TIME_DATE|TIME_MINUTES|TIME_SECONDS),
-                        (IsBull(open, close, leg) ? "bull" : (IsBear(open, close, leg) ? "bear" : "doji")),
-                        TimeToString(time[baseStart], TIME_DATE|TIME_MINUTES|TIME_SECONDS),
-                        TimeToString(time[baseEnd],   TIME_DATE|TIME_MINUTES|TIME_SECONDS),
-                        (int)(MathAbs(baseStart - baseEnd) + 1),
-                        (bt==Demand ? "Demand" : "Supply"),
-                        reason,
-                        prox, dist);
+            int legOut = OlderIndex(iCls, k, series);
+            if(!IndexInWindow(legOut, winOldest, winNewest, series))
+               break;
+
+            Zone z;
+            if(!BuildZoneFromLegOut(time, open, high, low, close,
+                                    legOut, iCls, iCur, series, winOldest, winNewest,
+                                    z))
+               continue;
+
+            // ignore zones older than window (extra safety)
+            if(z.tStart < oldestAllowed)
+               continue;
+
+            // skip if already known
+            if(FindZoneByName(z.name, zonesActive) >= 0) continue;
+            if(FindZoneByName(z.name, zonesDead)   >= 0) continue;
+
+            int n = ArraySize(newFound);
+            ArrayResize(newFound, n + 1);
+            newFound[n] = z;
          }
 
-         ZoneObjectCreateOrUpdate(z);
-         drawn++;
+         // IMPORTANT FIX: process zones oldest->newest so confirmation works
+         SortZonesByLegOutTimeAsc(newFound);
+
+         // 3) For each new zone in chronological order:
+         //    - confirm it if its leg-out move takes out opposing active zones
+         //    - add it to active/dead
+         for(int i = 0; i < ArraySize(newFound); ++i)
+         {
+            // confirm only if it's not already eliminated
+            ApplyConfirmationOnNewZone(newFound[i], time, high, low, series, winOldest, winNewest, iCls);
+
+            if(newFound[i].status == Eliminated)
+            {
+               MoveToDead(newFound[i]);
+            }
+            else
+            {
+               int n = ArraySize(zonesActive);
+               ArrayResize(zonesActive, n + 1);
+               zonesActive[n] = newFound[i];
+            }
+
+            // opposing zones may have been eliminated by confirmation
+            SweepEliminatedFromActive();
+         }
+      }
+
+      // 4) Draw/update zones
+      for(int i = 0; i < ArraySize(zonesActive); ++i)
+         DrawZone(zonesActive[i]);
+
+      if(InpShowEliminated)
+      {
+         for(int i = 0; i < ArraySize(zonesDead); ++i)
+            DrawZone(zonesDead[i]);
+      }
+      else
+      {
+         for(int i = 0; i < ArraySize(zonesDead); ++i)
+            DeleteObjectExact(zonesDead[i].name);
       }
    }
-
-   // ---------- Step 1 TEST zone (still fake) ----------
-   Zone test;
-   test.type      = Demand;
-   test.status    = Potential;
-   test.baseStart = iCls;
-   test.baseEnd   = iCls;
-
-   test.distal   = low[iCls];
-   test.proximal = MathMin(open[iCls], close[iCls]);
-   if(MathAbs(test.proximal - test.distal) < (_Point * 2.0))
-      test.proximal = test.distal + (_Point * 10.0);
-
-   test.tStart = time[iCls];
-   test.tEnd   = (datetime)(time[iCur] + PeriodSeconds(_Period));
-   test.name   = MakeBasePrefix() + "TEST";
-
-   if(ArraySize(zones) == 0)
-      ZoneAdd(test);
    else
-      zones[0] = test;
-
-   ZoneObjectCreateOrUpdate(zones[0]);
+   {
+      // same-bar ticks: extend active zones visually to now (cheap updates)
+      for(int i = 0; i < ArraySize(zonesActive); ++i)
+      {
+         if(zonesActive[i].status != Eliminated)
+         {
+            zonesActive[i].tEnd = (datetime)(time[iCur] + PeriodSeconds(_Period));
+            DrawZone(zonesActive[i]);
+         }
+      }
+   }
 
    return rates_total;
 }
