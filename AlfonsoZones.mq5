@@ -1,21 +1,23 @@
 //+------------------------------------------------------------------+
 //|                                                   AlfonsoZones   |
-//|   Step 5 (revised): Filled zones + proper confirmation            |
-//|   - Filled rectangles (single OBJ_RECTANGLE per zone)             |
-//|   - Zone color affects both border & fill                         |
-//|   - Confirmed zones: potential zone that takes out opposing zone  |
-//|     (checks leg-out move, not just one candle)                    |
-//|   - Processes zones oldest->newest for correct confirmation       |
+//|   Step 6 FIX: Full historical replay (oldest->newest)            |
+//|   - Rebuilds zones + TL breaks candle-by-candle on chart load     |
+//|   - Potential zones are NOT used for trend/takeout logic          |
+//|   - Confirmed zones are "real" zones                              |
+//|   - TL breaks require full OHLC across line (no touch)            |
+//|   - TL break confirms: touched-base zones + extreme-distal zone   |
+//|   - Takeout confirms: when a CONFIRMED zone breaks, the closest   |
+//|     opposing POTENTIAL (by proximal distance) becomes Confirmed   |
 //+------------------------------------------------------------------+
 #property strict
 #property indicator_chart_window
-
 #property indicator_plots   1
 #property indicator_buffers 1
 #property indicator_type1   DRAW_NONE
 #property indicator_label1  ""
 
 //------------------------- Inputs -----------------------------------
+// Zone engine
 input int    InpLookbackBars      = 2000;
 input bool   InpDebug             = true;
 input string InpObjPrefix         = "SDZ_";
@@ -33,16 +35,18 @@ input int    InpBaseMaxBars               = 6;     // STRICT: >max => reject (no
 input bool   InpAllowSingleCandleBase     = true;
 input bool   InpBaseUseEngulfPierceHarami = true;
 
-// Detection + confirmation
-input int    InpScanPatternBars        = 800;  // scan last N closed bars for leg-outs
-input int    InpMaxZonesProcess        = 120;  // cap new zones processed per bar
-input int    InpConfirmLookaheadBars   = 30;   // leg-out "move": scan forward up to N candles to take out opposing zone
+// Detection
+input int    InpMaxZonesProcess        = 140;  // safety cap during rebuild
 
-// Display
-input bool   InpDrawZones        = true;
-input bool   InpShowEliminated   = true;
+// Confirm by trendline break: move window after swing endpoint
+input int    InpConfirmLookaheadBars   = 300; // (kept; not used for scanning anymore)
 
-// Colors (your defaults)
+// Display toggles
+input bool   InpShowPotential   = true;
+input bool   InpShowConfirmed   = true;
+input bool   InpShowEliminated  = true;
+
+// Zone colors (border == fill)
 input color  InpPotentialDemandColor = clrMintCream;
 input color  InpPotentialSupplyColor = clrLavenderBlush;
 input color  InpEliminatedColor      = clrOrangeRed;
@@ -52,6 +56,21 @@ input color  InpConfirmedColor       = clrMidnightBlue;
 input int    InpWidthPotential   = 1;
 input int    InpWidthConfirmed   = 2;
 input int    InpWidthEliminated  = 1;
+
+//----------------- Trendline inputs (your code) ---------------------
+input int    SwingPeriod    = 3;
+input int    CandleWindow   = 200;
+input int    ATRPeriod      = 14;
+input int    LineStyle      = 2;        // 0..4
+input int    LineWidth      = 1;        // >=1
+input color  LineColor      = clrSilver;
+input bool   OnlySwingHigh  = false;
+input bool   OnlySwingLow   = false;
+
+// Angle filtering
+input bool   AngleBased     = false;
+input double MinAngle       = 0.01;     // inclusive
+input double MaxAngle       = 1.0;      // inclusive
 
 //------------------------- Types ------------------------------------
 enum ZoneType   { Demand = 0, Supply = 1 };
@@ -71,27 +90,39 @@ struct Zone
    double     distal;
 
    datetime   tStart;       // time[baseStart]
+   datetime   tBaseEnd;     // time[baseEnd]
    datetime   tEnd;         // now unless broken, else breaker candle time
-   datetime   tLegOut;      // time[legOut] (used for sorting / confirmation)
+   datetime   tLegOut;      // time[legOut]
 
    string     name;         // unique object name
    string     tag;          // DBR/RBD/RBR/DBD
+};
+
+struct TLInfo
+{
+   bool     has;
+   datetime t1, t2;
+   double   p1, p2;
+   int      swing_ns;     // newer swing idx in NS space
+   datetime swingTime;    // time at newer swing
 };
 
 //------------------------- Storage ----------------------------------
 double   g_dummyBuffer[];
 datetime g_lastClosedTime = 0;
 
-Zone zonesActive[]; // Potential + Confirmed (not eliminated)
+Zone zonesActive[]; // Potential + Confirmed
 Zone zonesDead[];   // Eliminated history
+
+// last processed TL-break times (to avoid reprocessing)
+datetime g_high_lastBreak = 0;
+datetime g_low_lastBreak  = 0;
+
+// ATR handle for angle filtering (optional)
+int g_atrHandle = INVALID_HANDLE;
 
 //------------------------- Utilities --------------------------------
 void DebugPrint(const string msg){ if(InpDebug) Print(msg); }
-
-string MakeBasePrefix()
-{
-   return (InpObjPrefix + _Symbol + "_" + IntegerToString((int)_Period) + "_");
-}
 
 bool StartsWith(const string s, const string prefix)
 {
@@ -99,6 +130,11 @@ bool StartsWith(const string s, const string prefix)
    if(plen <= 0) return false;
    if((int)StringLen(s) < plen) return false;
    return (StringSubstr(s, 0, plen) == prefix);
+}
+
+string MakeZonePrefix()
+{
+   return (InpObjPrefix + _Symbol + "_" + IntegerToString((int)_Period) + "_");
 }
 
 void DeleteObjectsByPrefix(const string pfx)
@@ -169,6 +205,18 @@ bool IndexInWindow(const int idx, const int winOldest, const int winNewest, cons
 
 int OlderIndex(const int idx, const int k, const bool series){ return (series ? (idx + k) : (idx - k)); }
 int NewerIndex(const int idx, const int k, const bool series){ return (series ? (idx - k) : (idx + k)); }
+
+// Map non-series index (0 oldest..rates_total-1 newest) to actual array index
+int MapNS2Arr(const int ns_i, const int rates_total, const bool seriesArrays)
+{
+   return (seriesArrays ? (rates_total - 1 - ns_i) : ns_i);
+}
+
+// Map array index to NS index
+int MapArr2NS(const int arr_i, const int rates_total, const bool seriesArrays)
+{
+   return (seriesArrays ? (rates_total - 1 - arr_i) : arr_i);
+}
 
 //------------------------- Candle helpers ----------------------------
 double CandleRange(const double &high[], const double &low[], const int i)
@@ -311,7 +359,6 @@ bool FindBaseStrictBeforeLegOut(const datetime &time[],
    int prev = OlderIndex(legOut, 1, series);
    if(!IndexInWindow(prev, winOldest, winNewest, series)) return false;
 
-   // Count contiguous basing candles before legOut
    int count = 0;
    baseEnd = prev;
    int cur = prev;
@@ -371,45 +418,6 @@ bool FindBaseStrictBeforeLegOut(const datetime &time[],
 }
 
 //------------------------- Zone build --------------------------------
-bool FindFirstBreakerAfterLegOut(const datetime &time[],
-                                 const double &high[], const double &low[],
-                                 const int legOut, const int iCls,
-                                 const bool series,
-                                 const int winOldest, const int winNewest,
-                                 const ZoneType zt,
-                                 const double distal,
-                                 int &breakerIdx)
-{
-   breakerIdx = -1;
-
-   int idx = NewerIndex(legOut, 1, series);
-   while(IndexInWindow(idx, winOldest, winNewest, series))
-   {
-      // stop past newest closed candle
-      if(series)
-      {
-         if(idx < iCls) break;
-      }
-      else
-      {
-         if(idx > iCls) break;
-      }
-
-      if(zt == Demand)
-      {
-         if(low[idx] < distal){ breakerIdx = idx; return true; }
-      }
-      else
-      {
-         if(high[idx] > distal){ breakerIdx = idx; return true; }
-      }
-
-      if(idx == iCls) break;
-      idx = NewerIndex(idx, 1, series);
-   }
-   return false;
-}
-
 bool BuildZoneFromLegOut(const datetime &time[],
                          const double &open[], const double &high[], const double &low[], const double &close[],
                          const int legOut,
@@ -459,19 +467,12 @@ bool BuildZoneFromLegOut(const datetime &time[],
    outZone.distal    = dist;
 
    outZone.tStart    = time[baseStart];
+   outZone.tBaseEnd  = time[baseEnd];
    outZone.tLegOut   = time[legOut];
-   outZone.tEnd      = (datetime)(time[iCur] + PeriodSeconds(_Period)); // default extend to now
+   outZone.tEnd      = (datetime)(time[iCur] + PeriodSeconds(_Period)); // extend to "now" at this step
 
    outZone.tag       = tag;
-   outZone.name      = MakeBasePrefix() + "ZONE_" + tag + "_" + IntegerToString((long)outZone.tLegOut);
-
-   // End at breaker if already broken in history
-   int breakerIdx=-1;
-   if(FindFirstBreakerAfterLegOut(time, high, low, legOut, iCls, series, winOldest, winNewest, zt, dist, breakerIdx))
-   {
-      outZone.status = Eliminated;
-      outZone.tEnd   = time[breakerIdx];
-   }
+   outZone.name      = MakeZonePrefix() + "ZONE_" + tag + "_" + IntegerToString((long)outZone.tLegOut);
 
    return true;
 }
@@ -493,80 +494,127 @@ void MoveToDead(const Zone &z)
    zonesDead[n] = z;
 }
 
-bool CandleTakesOutZone(const double &high[], const double &low[], const int candleIndex, const Zone &target)
+// prune zones older than the window (to avoid drawing ancient zones)
+void PruneZonesOutsideWindow(const datetime oldestAllowedTime)
 {
-   if(target.status == Eliminated) return false;
-   if(target.type == Supply) return (high[candleIndex] > target.distal);
-   return (low[candleIndex] < target.distal); // Demand
-}
-
-//------------------------- Confirmation (fixed) ----------------------
-// Confirm new zone if its LEG-OUT MOVE (legOut .. legOut+N) takes out an older opposing active zone.
-// We must process zones chronologically for this to work (done below).
-void ApplyConfirmationOnNewZone(Zone &newZ,
-                                const datetime &time[],
-                                const double &high[],
-                                const double &low[],
-                                const bool series,
-                                const int winOldest, const int winNewest,
-                                const int iCls)
-{
-   if(newZ.status == Eliminated) return;
-
-   datetime newBaseTime = newZ.tStart;
-
-   for(int i = 0; i < ArraySize(zonesActive); ++i)
+   for(int i = ArraySize(zonesActive) - 1; i >= 0; --i)
    {
-      if(zonesActive[i].status == Eliminated) continue;
-      if(zonesActive[i].type == newZ.type)    continue; // must be opposing
-      if(zonesActive[i].tStart >= newBaseTime) continue; // must pre-exist before base
-
-      // Scan forward from legOut for up to InpConfirmLookaheadBars closed candles
-      bool tookOut = false;
-      int takeIdx = -1;
-
-      for(int k = 0; k <= InpConfirmLookaheadBars; ++k)
+      if(zonesActive[i].tStart < oldestAllowedTime)
       {
-         int idx = NewerIndex(newZ.legOut, k, series);
-         if(!IndexInWindow(idx, winOldest, winNewest, series)) break;
-
-         // only consider up to newest closed candle
-         if(series)
-         {
-            if(idx < iCls) break;
-         }
-         else
-         {
-            if(idx > iCls) break;
-         }
-
-         if(CandleTakesOutZone(high, low, idx, zonesActive[i]))
-         {
-            tookOut = true;
-            takeIdx = idx;
-            break;
-         }
-      }
-
-      if(tookOut && takeIdx >= 0)
-      {
-         // eliminate opposing zone at the takeout candle
-         zonesActive[i].status = Eliminated;
-         zonesActive[i].tEnd   = time[takeIdx];
-
-         // confirm new zone
-         newZ.status = Confirmed;
-
-         if(InpDebug)
-         {
-            PrintFormat("CONFIRMED: %s (%s) took out %s (%s) at %s",
-                        newZ.name, newZ.tag,
-                        zonesActive[i].name, zonesActive[i].tag,
-                        TimeToString(time[takeIdx], TIME_DATE|TIME_MINUTES|TIME_SECONDS));
-         }
-         // keep scanning: one move could take out multiple opposing zones
+         DeleteObjectExact(zonesActive[i].name);
+         for(int j = i; j < ArraySize(zonesActive) - 1; ++j) zonesActive[j] = zonesActive[j + 1];
+         ArrayResize(zonesActive, ArraySize(zonesActive) - 1);
       }
    }
+   for(int i = ArraySize(zonesDead) - 1; i >= 0; --i)
+   {
+      if(zonesDead[i].tStart < oldestAllowedTime)
+      {
+         DeleteObjectExact(zonesDead[i].name);
+         for(int j = i; j < ArraySize(zonesDead) - 1; ++j) zonesDead[j] = zonesDead[j + 1];
+         ArrayResize(zonesDead, ArraySize(zonesDead) - 1);
+      }
+   }
+}
+
+//------------------------- Takeout responsibility --------------------
+// When a CONFIRMED zone is eliminated, the responsible zone is the closest opposing zone by
+// price distance using proximal line (closest to breaker price).
+int FindResponsibleOpposingZone(const Zone &brokenZone,
+                                const datetime breakTime,
+                                const double breakerPrice)
+{
+   int bestIdx = -1;
+   double bestDist = DBL_MAX;
+
+   for(int i=0; i<ArraySize(zonesActive); ++i)
+   {
+      if(zonesActive[i].status == Eliminated) continue;
+      if(zonesActive[i].type == brokenZone.type) continue; // opposing only
+      if(zonesActive[i].tStart > breakTime) continue;      // must exist by break time
+
+      // Direction sanity filter:
+      if(brokenZone.type == Demand)
+      {
+         if(zonesActive[i].type != Supply) continue;
+         if(zonesActive[i].proximal <= breakerPrice) continue;
+      }
+      else
+      {
+         if(zonesActive[i].type != Demand) continue;
+         if(zonesActive[i].proximal >= breakerPrice) continue;
+      }
+
+      double d = MathAbs(zonesActive[i].proximal - breakerPrice);
+      if(d < bestDist)
+      {
+         bestDist = d;
+         bestIdx = i;
+      }
+   }
+
+   return bestIdx;
+}
+
+//------------------------- Lifecycle update (Eliminate + credit) -----
+void UpdateZoneLifecycleOnClose(Zone &z,
+                                const datetime &time[],
+                                const double &high[], const double &low[],
+                                const int iCls, const int iCur)
+{
+   if(z.status == Eliminated)
+      return;
+
+   bool broken = false;
+   double breakerPrice = 0.0;
+
+   if(z.type == Demand)
+   {
+      if(low[iCls] < z.distal)
+      {
+         broken = true;
+         breakerPrice = low[iCls];
+      }
+   }
+   else
+   {
+      if(high[iCls] > z.distal)
+      {
+         broken = true;
+         breakerPrice = high[iCls];
+      }
+   }
+
+   if(broken)
+   {
+      ZoneStatus prevStatus = z.status;
+      z.status = Eliminated;
+      z.tEnd   = time[iCls];
+
+      // Only CONFIRMED zones count for takeout/credit.
+      if(prevStatus == Confirmed)
+      {
+         int respIdx = FindResponsibleOpposingZone(z, time[iCls], breakerPrice);
+         if(respIdx >= 0)
+         {
+            if(zonesActive[respIdx].status == Potential)
+            {
+               zonesActive[respIdx].status = Confirmed;
+               if(InpDebug)
+               {
+                  PrintFormat("CONFIRM_BY_TAKEOUT: %s confirmed because it broke confirmed %s at %s",
+                              zonesActive[respIdx].name,
+                              z.name,
+                              TimeToString(time[iCls], TIME_DATE|TIME_MINUTES|TIME_SECONDS));
+               }
+            }
+         }
+      }
+      return;
+   }
+
+   // Not broken -> extend to "now" at this step
+   z.tEnd = (datetime)(time[iCur] + PeriodSeconds(_Period));
 }
 
 void SweepEliminatedFromActive()
@@ -583,71 +631,416 @@ void SweepEliminatedFromActive()
    }
 }
 
-// prune zones that are older than the current lookback window (so we never show before window)
-void PruneZonesOutsideWindow(const datetime oldestAllowedTime)
+//------------------------- Trendline names/drawing -------------------
+string TFToStr(ENUM_TIMEFRAMES tf)
 {
-   // Active
-   for(int i = ArraySize(zonesActive) - 1; i >= 0; --i)
+   switch(tf)
    {
-      if(zonesActive[i].tStart < oldestAllowedTime)
-      {
-         DeleteObjectExact(zonesActive[i].name);
-         for(int j = i; j < ArraySize(zonesActive) - 1; ++j) zonesActive[j] = zonesActive[j + 1];
-         ArrayResize(zonesActive, ArraySize(zonesActive) - 1);
-      }
-   }
-   // Dead
-   for(int i = ArraySize(zonesDead) - 1; i >= 0; --i)
-   {
-      if(zonesDead[i].tStart < oldestAllowedTime)
-      {
-         DeleteObjectExact(zonesDead[i].name);
-         for(int j = i; j < ArraySize(zonesDead) - 1; ++j) zonesDead[j] = zonesDead[j + 1];
-         ArrayResize(zonesDead, ArraySize(zonesDead) - 1);
-      }
+      case PERIOD_M1:   return "M1";
+      case PERIOD_M2:   return "M2";
+      case PERIOD_M3:   return "M3";
+      case PERIOD_M4:   return "M4";
+      case PERIOD_M5:   return "M5";
+      case PERIOD_M6:   return "M6";
+      case PERIOD_M10:  return "M10";
+      case PERIOD_M12:  return "M12";
+      case PERIOD_M15:  return "M15";
+      case PERIOD_M20:  return "M20";
+      case PERIOD_M30:  return "M30";
+      case PERIOD_H1:   return "H1";
+      case PERIOD_H2:   return "H2";
+      case PERIOD_H3:   return "H3";
+      case PERIOD_H4:   return "H4";
+      case PERIOD_H6:   return "H6";
+      case PERIOD_H8:   return "H8";
+      case PERIOD_H12:  return "H12";
+      case PERIOD_D1:   return "D1";
+      case PERIOD_W1:   return "W1";
+      case PERIOD_MN1:  return "MN1";
+      default:          return "TF"+(string)PeriodSeconds(tf);
    }
 }
 
-//------------------------- Lifecycle update --------------------------
-void UpdateZoneLifecycleOnNewClose(Zone &z,
-                                   const datetime &time[],
-                                   const double &high[], const double &low[],
-                                   const int iCls, const int iCur)
+string ObjName(bool isHigh)
 {
-   if(z.status == Eliminated)
-      return;
+   return StringFormat("SwingTL_%s_%s_P%d_%s",
+                       _Symbol,
+                       TFToStr((ENUM_TIMEFRAMES)_Period),
+                       SwingPeriod,
+                       isHigh ? "HIGH" : "LOW");
+}
 
-   // break check at newest closed candle
-   if(z.type == Demand)
+void DeleteAllLines()
+{
+   ObjectDelete(0, ObjName(true));
+   ObjectDelete(0, ObjName(false));
+}
+
+// Swing detection in NON-SERIES index space, mapped to actual arrays
+bool IsSwingHigh_NS(const double &h[], int i, int p, int rates_total, bool seriesArrays)
+{
+   if(i-p < 0 || i+p >= rates_total) return(false);
+   int ai = MapNS2Arr(i, rates_total, seriesArrays);
+   for(int k=1; k<=p; ++k)
    {
-      if(low[iCls] < z.distal)
+      int aim = MapNS2Arr(i-k, rates_total, seriesArrays);
+      int aip = MapNS2Arr(i+k, rates_total, seriesArrays);
+      if(!(h[ai] > h[aim] && h[ai] > h[aip])) return(false);
+   }
+   return(true);
+}
+
+bool IsSwingLow_NS(const double &l[], int i, int p, int rates_total, bool seriesArrays)
+{
+   if(i-p < 0 || i+p >= rates_total) return(false);
+   int ai = MapNS2Arr(i, rates_total, seriesArrays);
+   for(int k=1; k<=p; ++k)
+   {
+      int aim = MapNS2Arr(i-k, rates_total, seriesArrays);
+      int aip = MapNS2Arr(i+k, rates_total, seriesArrays);
+      if(!(l[ai] < l[aim] && l[ai] < l[aip])) return(false);
+   }
+   return(true);
+}
+
+void ConsiderPoint(int i, double price,
+                   int &idx_newest, double &px_newest,
+                   int &idx_second, double &px_second)
+{
+   if(idx_newest < 0 || i > idx_newest)
+   {
+      idx_second = idx_newest; px_second = px_newest;
+      idx_newest = i;          px_newest = price;
+   }
+   else if(idx_second < 0 || i > idx_second)
+   {
+      idx_second = i;          px_second = price;
+   }
+}
+
+bool GetATRAtArrIndex(const int arrIndex, double &atrVal)
+{
+   atrVal = 0.0;
+   if(g_atrHandle == INVALID_HANDLE) return false;
+   double buf[];
+   if(CopyBuffer(g_atrHandle, 0, arrIndex, 1, buf) != 1) return false;
+   atrVal = buf[0];
+   return (atrVal > 0.0);
+}
+
+bool AnglePass_ByATR(double older_px, double newer_px, int bars, double atr_val)
+{
+   if(!AngleBased) return true;
+   if(bars <= 0) return false;
+   if(atr_val <= 0.0) return false;
+   double angle = (MathAbs(newer_px - older_px) / atr_val) / bars;
+   return(angle >= MinAngle && angle <= MaxAngle);
+}
+
+// Compute trendline endpoints at a given historical "end" (ns_end = last closed in NS space).
+// No drawing here (used for historical replay and per-bar break checks).
+void ComputeTrendlineAt(const datetime &t[],
+                        const double &h[],
+                        const double &l[],
+                        const int rates_total,
+                        const bool seriesArrays,
+                        const int ns_end,
+                        const bool isHigh,
+                        TLInfo &out)
+{
+   out.has = false;
+   out.t1 = out.t2 = 0;
+   out.p1 = out.p2 = 0.0;
+   out.swing_ns = -1;
+   out.swingTime = 0;
+
+   int p = MathMax(1, SwingPeriod);
+   if(rates_total < (2*p + 1)) return;
+
+   // mimic your rule: last closed is ns_end, so i_end excludes last p bars
+   int i_end   = ns_end - p;
+   int i_start = MathMax(p, ns_end - CandleWindow - p);
+   if(i_end < i_start) return;
+
+   int newest=-1, second=-1;
+   double px_new=0.0, px_old=0.0;
+
+   for(int i = i_end; i >= i_start; --i)
+   {
+      bool ok = isHigh ? IsSwingHigh_NS(h, i, p, rates_total, seriesArrays)
+                       : IsSwingLow_NS(l, i, p, rates_total, seriesArrays);
+
+      if(ok)
       {
-         z.status = Eliminated;
-         z.tEnd   = time[iCls];
-         return;
+         int ai = MapNS2Arr(i, rates_total, seriesArrays);
+         double price = isHigh ? h[ai] : l[ai];
+         ConsiderPoint(i, price, newest, px_new, second, px_old);
+         if(newest >= 0 && second >= 0) break; // nearest pair is enough
       }
    }
+
+   if(newest < 0 || second < 0) return;
+
+   int older_idx = second;
+   int newer_idx = newest;
+   double older_px = px_old;
+   double newer_px = px_new;
+
+   if(older_idx > newer_idx)
+   {
+      int ti = older_idx; older_idx = newer_idx; newer_idx = ti;
+      double tp = older_px; older_px = newer_px; newer_px = tp;
+   }
+
+   // Angle filter (optional)
+   if(AngleBased)
+   {
+      int anew = MapNS2Arr(newer_idx, rates_total, seriesArrays);
+      double atr_val = 0.0;
+      if(!GetATRAtArrIndex(anew, atr_val)) return;
+      int bars = newer_idx - older_idx;
+      if(!AnglePass_ByATR(older_px, newer_px, bars, atr_val)) return;
+   }
+
+   int aold = MapNS2Arr(older_idx, rates_total, seriesArrays);
+   int anew = MapNS2Arr(newer_idx, rates_total, seriesArrays);
+
+   out.has = true;
+   out.t1 = t[aold]; out.p1 = older_px;
+   out.t2 = t[anew]; out.p2 = newer_px;
+   out.swing_ns = newer_idx;
+   out.swingTime = t[anew];
+}
+
+void DrawTrendlineObject(const string name,
+                         datetime t1,double p1, datetime t2,double p2,
+                         color clr, ENUM_LINE_STYLE style, int width)
+{
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_TREND, 0, t1, p1, t2, p2);
+
+   ObjectMove(0, name, 0, t1, p1);
+   ObjectMove(0, name, 1, t2, p2);
+
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, true);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, (int)style);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, MathMax(1, width));
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_BACK, false);
+}
+
+// Draw current trendlines (only once per tick set; used for visualization)
+void DrawCurrentTrendlines(const datetime &t[],
+                           const double &h[],
+                           const double &l[],
+                           const int rates_total,
+                           const bool seriesArrays,
+                           const int iClsArr)
+{
+   int ns_end = MapArr2NS(iClsArr, rates_total, seriesArrays);
+
+   TLInfo hi, lo;
+   ComputeTrendlineAt(t, h, l, rates_total, seriesArrays, ns_end, true,  hi);
+   ComputeTrendlineAt(t, h, l, rates_total, seriesArrays, ns_end, false, lo);
+
+   int s = MathMax(0, MathMin(4, LineStyle));
+   string nameHigh = ObjName(true);
+   string nameLow  = ObjName(false);
+
+   if((OnlySwingHigh || (!OnlySwingHigh && !OnlySwingLow) || (OnlySwingHigh && OnlySwingLow)) && hi.has)
+      DrawTrendlineObject(nameHigh, hi.t1, hi.p1, hi.t2, hi.p2, LineColor, (ENUM_LINE_STYLE)s, LineWidth);
    else
+      ObjectDelete(0, nameHigh);
+
+   if((OnlySwingLow || (!OnlySwingHigh && !OnlySwingLow) || (OnlySwingHigh && OnlySwingLow)) && lo.has)
+      DrawTrendlineObject(nameLow, lo.t1, lo.p1, lo.t2, lo.p2, LineColor, (ENUM_LINE_STYLE)s, LineWidth);
+   else
+      ObjectDelete(0, nameLow);
+}
+
+//------------------------- Line math + break tests -------------------
+double LinePriceAt(datetime t, datetime t1, double p1, datetime t2, double p2)
+{
+   long dt = (long)(t2 - t1);
+   if(dt == 0) return p2;
+   double slope = (p2 - p1) / (double)dt;
+   return p1 + slope * (double)((long)(t - t1));
+}
+
+bool FullOHLC_AboveLine(const datetime &time[], const double &open[], const double &high[],
+                        const double &low[], const double &close[],
+                        const int i, datetime t1,double p1, datetime t2,double p2)
+{
+   double lp = LinePriceAt(time[i], t1, p1, t2, p2);
+   double eps = _Point * 0.5;
+   return (open[i]  > lp + eps &&
+           high[i]  > lp + eps &&
+           low[i]   > lp + eps &&
+           close[i] > lp + eps);
+}
+
+bool FullOHLC_BelowLine(const datetime &time[], const double &open[], const double &high[],
+                        const double &low[], const double &close[],
+                        const int i, datetime t1,double p1, datetime t2,double p2)
+{
+   double lp = LinePriceAt(time[i], t1, p1, t2, p2);
+   double eps = _Point * 0.5;
+   return (open[i]  < lp - eps &&
+           high[i]  < lp - eps &&
+           low[i]   < lp - eps &&
+           close[i] < lp - eps);
+}
+
+//------------------------- TL-break -> confirm zones -----------------
+bool ZoneTouchesLineWick(const Zone &z,
+                         const datetime &time[],
+                         const double &high[], const double &low[],
+                         const bool series,
+                         datetime t1,double p1, datetime t2,double p2)
+{
+   int idx = z.baseStart;
+   while(true)
    {
-      if(high[iCls] > z.distal)
+      double lp = LinePriceAt(time[idx], t1, p1, t2, p2);
+      if(low[idx] <= lp && high[idx] >= lp)
+         return true;
+
+      if(idx == z.baseEnd) break;
+      idx = NewerIndex(idx, 1, series);
+      if(idx < 0) break;
+   }
+   return false;
+}
+
+// breakOnHighLine=true => confirms Demand, else confirms Supply
+void ConfirmZonesByTLBreak(bool breakOnHighLine,
+                           datetime swingTime, datetime breakTime,
+                           const datetime &time[],
+                           const double &high[], const double &low[],
+                           const bool series,
+                           datetime t1,double p1, datetime t2,double p2)
+{
+   if(breakTime <= 0 || swingTime <= 0) return;
+
+   ZoneType toConfirm = breakOnHighLine ? Demand : Supply;
+
+   datetime a = swingTime;
+   datetime b = breakTime;
+   if(b < a){ datetime tmp=a; a=b; b=tmp; }
+
+   int extremeIdx = -1;
+   double extremeDistal = (toConfirm==Demand ? DBL_MAX : -DBL_MAX);
+
+   // pick candidates whose BASE interval intersects [a..b]
+   for(int i=0; i<ArraySize(zonesActive); ++i)
+   {
+      if(zonesActive[i].status != Potential) continue;
+      if(zonesActive[i].type != toConfirm) continue;
+
+      // interval intersection
+      if(zonesActive[i].tStart > b) continue;
+      if(zonesActive[i].tBaseEnd < a) continue;
+
+      if(toConfirm == Demand)
       {
-         z.status = Eliminated;
-         z.tEnd   = time[iCls];
-         return;
+         if(zonesActive[i].distal < extremeDistal)
+         {
+            extremeDistal = zonesActive[i].distal;
+            extremeIdx = i;
+         }
+      }
+      else
+      {
+         if(zonesActive[i].distal > extremeDistal)
+         {
+            extremeDistal = zonesActive[i].distal;
+            extremeIdx = i;
+         }
       }
    }
 
-   // extend to now
-   z.tEnd = (datetime)(time[iCur] + PeriodSeconds(_Period));
+   // confirm all touched zones in interval
+   for(int i=0; i<ArraySize(zonesActive); ++i)
+   {
+      if(zonesActive[i].status != Potential) continue;
+      if(zonesActive[i].type != toConfirm) continue;
+      if(zonesActive[i].tStart > b) continue;
+      if(zonesActive[i].tBaseEnd < a) continue;
+
+      if(ZoneTouchesLineWick(zonesActive[i], time, high, low, series, t1,p1,t2,p2))
+      {
+         zonesActive[i].status = Confirmed;
+         if(InpDebug)
+         {
+            PrintFormat("CONFIRM_BY_TL_TOUCH: %s confirmed at break %s",
+                        zonesActive[i].name,
+                        TimeToString(breakTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS));
+         }
+      }
+   }
+
+   // confirm extreme-distal zone
+   if(extremeIdx >= 0 && zonesActive[extremeIdx].status == Potential)
+   {
+      zonesActive[extremeIdx].status = Confirmed;
+      if(InpDebug)
+      {
+         PrintFormat("CONFIRM_BY_TL_EXTREME: %s confirmed (distal extreme) at break %s",
+                     zonesActive[extremeIdx].name,
+                     TimeToString(breakTime, TIME_DATE|TIME_MINUTES|TIME_SECONDS));
+      }
+   }
 }
 
-//------------------------- Drawing (single filled rectangle) ---------
+bool CheckAndProcessTLBreakAtBar(const bool breakOnHighLine,
+                                const TLInfo &tl,
+                                const datetime &time[],
+                                const double &open[],
+                                const double &high[],
+                                const double &low[],
+                                const double &close[],
+                                const int barIdx,
+                                const bool series,
+                                datetime &lastBreakStore)
+{
+   if(!tl.has) return false;
+
+   // must be after the newer swing endpoint
+   if(time[barIdx] <= tl.swingTime) return false;
+
+   // don't reprocess
+   if(time[barIdx] <= lastBreakStore) return false;
+
+   bool isBreak = false;
+   if(breakOnHighLine)
+      isBreak = FullOHLC_AboveLine(time, open, high, low, close, barIdx, tl.t1,tl.p1,tl.t2,tl.p2);
+   else
+      isBreak = FullOHLC_BelowLine(time, open, high, low, close, barIdx, tl.t1,tl.p1,tl.t2,tl.p2);
+
+   if(!isBreak) return false;
+
+   lastBreakStore = time[barIdx];
+
+   ConfirmZonesByTLBreak(breakOnHighLine,
+                         tl.swingTime, time[barIdx],
+                         time, high, low, series,
+                         tl.t1,tl.p1,tl.t2,tl.p2);
+
+   return true;
+}
+
+//------------------------- Drawing (filled rectangle) ----------------
+bool ShouldDrawStatus(ZoneStatus st)
+{
+   if(st == Potential)  return InpShowPotential;
+   if(st == Confirmed)  return InpShowConfirmed;
+   return InpShowEliminated;
+}
+
 color ZoneColorFor(const Zone &z)
 {
    if(z.status == Eliminated) return InpEliminatedColor;
    if(z.status == Confirmed)  return InpConfirmedColor;
-
-   // Potential by type
    return (z.type == Demand ? InpPotentialDemandColor : InpPotentialSupplyColor);
 }
 
@@ -660,7 +1053,7 @@ int ZoneWidthFor(const Zone &z)
 
 bool DrawZone(const Zone &z)
 {
-   if(!InpShowEliminated && z.status == Eliminated)
+   if(!ShouldDrawStatus(z.status))
    {
       DeleteObjectExact(z.name);
       return true;
@@ -668,7 +1061,6 @@ bool DrawZone(const Zone &z)
 
    const long chart_id = 0;
 
-   // create or update the rectangle
    double top = MathMax(z.proximal, z.distal);
    double bot = MathMin(z.proximal, z.distal);
    if(MathAbs(top - bot) < (_Point * 2.0))
@@ -699,45 +1091,123 @@ bool DrawZone(const Zone &z)
    ObjectSetInteger(chart_id, z.name, OBJPROP_COLOR, (long)c);
    ObjectSetInteger(chart_id, z.name, OBJPROP_STYLE, STYLE_SOLID);
    ObjectSetInteger(chart_id, z.name, OBJPROP_WIDTH, w);
-   ObjectSetInteger(chart_id, z.name, OBJPROP_FILL, true);     // filled rectangle
+   ObjectSetInteger(chart_id, z.name, OBJPROP_FILL, true);
    ObjectSetInteger(chart_id, z.name, OBJPROP_BACK, true);
 
-   // description includes exact candle time for base start + legout
    string desc =
       z.tag + " | " +
       (z.type==Demand ? "Demand" : "Supply") + " | " +
       (z.status==Potential ? "Potential" : (z.status==Confirmed ? "Confirmed" : "Eliminated")) +
       " | base: " + TimeToString(z.tStart, TIME_DATE|TIME_MINUTES|TIME_SECONDS) +
+      " -> "      + TimeToString(z.tBaseEnd, TIME_DATE|TIME_MINUTES|TIME_SECONDS) +
       " | legOut: " + TimeToString(z.tLegOut, TIME_DATE|TIME_MINUTES|TIME_SECONDS) +
       " | end: "  + TimeToString(z.tEnd, TIME_DATE|TIME_MINUTES|TIME_SECONDS);
 
-   ObjectSetString(chart_id, z.name, OBJPROP_TEXT, desc);
+   // OBJ_RECTANGLE often shows tooltip best
+   ObjectSetString(chart_id, z.name, OBJPROP_TOOLTIP, desc);
 
    return true;
 }
 
-//------------------------- Sorting new zones by time (oldest->newest)
-void SortZonesByLegOutTimeAsc(Zone &arr[])
+//------------------------- Historical rebuild (key fix) --------------
+void ResetAllState()
 {
-   int n = ArraySize(arr);
-   for(int i = 1; i < n; ++i)
+   DeleteObjectsByPrefix(MakeZonePrefix());
+   DeleteAllLines();
+
+   ArrayResize(zonesActive, 0);
+   ArrayResize(zonesDead, 0);
+
+   g_lastClosedTime = 0;
+   g_high_lastBreak = 0;
+   g_low_lastBreak  = 0;
+}
+
+void RebuildFromHistory(const int rates_total,
+                        const datetime &time[],
+                        const double &open[],
+                        const double &high[],
+                        const double &low[],
+                        const double &close[],
+                        const bool series,
+                        const int winOldest,
+                        const int winNewest)
+{
+   ResetAllState();
+
+   int iCurArr = IndexCurrentBar(time, rates_total);
+   int iClsArr = IndexLastClosedBar(time, rates_total);
+
+   // replay only inside the window
+   int ns_winOldest = MapArr2NS(winOldest, rates_total, series);
+   int ns_iCls      = MapArr2NS(iClsArr,  rates_total, series);
+
+   // safety: avoid insane work
+   int created = 0;
+
+   // start a bit later so swing logic has room
+   int warmup = MathMax(2*SwingPeriod + 2, InpAvgRangeLen + 2);
+   int ns_start = MathMax(ns_winOldest, warmup);
+
+   for(int ns = ns_start; ns <= ns_iCls; ++ns)
    {
-      Zone key = arr[i];
-      int j = i - 1;
-      while(j >= 0 && arr[j].tLegOut > key.tLegOut)
+      int iCls = MapNS2Arr(ns, rates_total, series);
+      int iCur = iCls;
+
+      // 1) Detect zone from THIS candle as legOut (no backward scanning; candle-by-candle)
+      if(created < InpMaxZonesProcess)
       {
-         arr[j + 1] = arr[j];
-         j--;
+         Zone z;
+         if(BuildZoneFromLegOut(time, open, high, low, close,
+                                iCls, iCls, iCur, series, winOldest, winNewest,
+                                z))
+         {
+            if(FindZoneByName(z.name, zonesActive) < 0 &&
+               FindZoneByName(z.name, zonesDead)   < 0)
+            {
+               int n = ArraySize(zonesActive);
+               ArrayResize(zonesActive, n + 1);
+               zonesActive[n] = z;
+               created++;
+            }
+         }
       }
-      arr[j + 1] = key;
+
+      // 2) Update lifecycle on this close (eliminate + takeout credit)
+      for(int i = ArraySize(zonesActive) - 1; i >= 0; --i)
+         UpdateZoneLifecycleOnClose(zonesActive[i], time, high, low, iCls, iCur);
+
+      SweepEliminatedFromActive();
+
+      // 3) Compute trendlines at THIS historical point and process break on THIS candle
+      TLInfo tlHigh, tlLow;
+      ComputeTrendlineAt(time, high, low, rates_total, series, ns, true,  tlHigh);
+      ComputeTrendlineAt(time, high, low, rates_total, series, ns, false, tlLow);
+
+      // HIGH TL break up => confirm Demand
+      if(!OnlySwingLow) // respect settings loosely
+         CheckAndProcessTLBreakAtBar(true, tlHigh, time, open, high, low, close, iCls, series, g_high_lastBreak);
+
+      // LOW TL break down => confirm Supply
+      if(!OnlySwingHigh)
+         CheckAndProcessTLBreakAtBar(false, tlLow, time, open, high, low, close, iCls, series, g_low_lastBreak);
    }
+
+   // set last closed time to prevent double-processing
+   g_lastClosedTime = time[iClsArr];
+
+   // Draw zones once after rebuild
+   for(int i=0; i<ArraySize(zonesActive); ++i) DrawZone(zonesActive[i]);
+   for(int i=0; i<ArraySize(zonesDead);   ++i) DrawZone(zonesDead[i]);
+
+   // Draw current trendlines for visibility
+   DrawCurrentTrendlines(time, high, low, rates_total, series, iClsArr);
 }
 
 //------------------------- Indicator lifecycle -----------------------
 int OnInit()
 {
-   DebugPrint("AlfonsoZones: OnInit()");
-   IndicatorSetString(INDICATOR_SHORTNAME, "AlfonsoZones (Step5)");
+   IndicatorSetString(INDICATOR_SHORTNAME, "AlfonsoZones (Step6 FIX Replay)");
 
    ArraySetAsSeries(g_dummyBuffer, true);
    SetIndexBuffer(0, g_dummyBuffer, INDICATOR_DATA);
@@ -745,15 +1215,29 @@ int OnInit()
 
    ArrayResize(zonesActive, 0);
    ArrayResize(zonesDead, 0);
+
    g_lastClosedTime = 0;
+   g_high_lastBreak = 0;
+   g_low_lastBreak  = 0;
+
+   DeleteAllLines();
+
+   // ATR handle for optional angle filter
+   g_atrHandle = iATR(_Symbol, _Period, MathMax(1, ATRPeriod));
 
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
-   DebugPrint("AlfonsoZones: OnDeinit()");
-   DeleteObjectsByPrefix(MakeBasePrefix());
+   DeleteObjectsByPrefix(MakeZonePrefix());
+   DeleteAllLines();
+
+   if(g_atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_atrHandle);
+      g_atrHandle = INVALID_HANDLE;
+   }
 }
 
 //------------------------- Main calculation --------------------------
@@ -770,7 +1254,7 @@ int OnCalculate(
    const int &spread[]
 )
 {
-   if(rates_total < 2) return 0;
+   if(rates_total < 10) return 0;
    g_dummyBuffer[0] = EMPTY_VALUE;
 
    const bool series = IsSeriesOrder(time, rates_total);
@@ -784,101 +1268,68 @@ int OnCalculate(
    if(!IndexInWindow(iCls, winOldest, winNewest, series))
       return rates_total;
 
-   // enforce "don't draw before window"
+   // On first load / refresh: full replay from oldest->newest
+   if(prev_calculated == 0)
+   {
+      RebuildFromHistory(rates_total, time, open, high, low, close, series, winOldest, winNewest);
+      return rates_total;
+   }
+
+   // Normal live update (bar-by-bar)
    datetime oldestAllowed = time[winOldest];
    PruneZonesOutsideWindow(oldestAllowed);
 
    bool newClosedBar = (time[iCls] != g_lastClosedTime);
-   if(newClosedBar) g_lastClosedTime = time[iCls];
-
    if(newClosedBar)
    {
-      // 1) Update existing active zones (break/extend) using newly closed candle
-      for(int i = ArraySize(zonesActive) - 1; i >= 0; --i)
-         UpdateZoneLifecycleOnNewClose(zonesActive[i], time, high, low, iCls, iCur);
+      g_lastClosedTime = time[iCls];
 
-      // Move newly eliminated to dead
+      // 1) Detect zone from THIS candle as legOut
+      Zone z;
+      if(BuildZoneFromLegOut(time, open, high, low, close,
+                             iCls, iCls, iCur, series, winOldest, winNewest,
+                             z))
+      {
+         if(z.tStart >= oldestAllowed &&
+            FindZoneByName(z.name, zonesActive) < 0 &&
+            FindZoneByName(z.name, zonesDead)   < 0)
+         {
+            int n = ArraySize(zonesActive);
+            ArrayResize(zonesActive, n + 1);
+            zonesActive[n] = z;
+         }
+      }
+
+      // 2) Lifecycle update (eliminate + takeout credit)
+      for(int i = ArraySize(zonesActive) - 1; i >= 0; --i)
+         UpdateZoneLifecycleOnClose(zonesActive[i], time, high, low, iCls, iCur);
+
       SweepEliminatedFromActive();
 
-      // 2) Detect new zones from scan window
-      if(InpDrawZones)
-      {
-         int scan = InpScanPatternBars; if(scan < 10) scan = 10;
+      // 3) Compute current TLs and check break on THIS close candle
+      int ns_end = MapArr2NS(iCls, rates_total, series);
 
-         Zone newFound[];
-         ArrayResize(newFound, 0);
+      TLInfo tlHigh, tlLow;
+      ComputeTrendlineAt(time, high, low, rates_total, series, ns_end, true,  tlHigh);
+      ComputeTrendlineAt(time, high, low, rates_total, series, ns_end, false, tlLow);
 
-         for(int k = 0; k < scan && ArraySize(newFound) < InpMaxZonesProcess; ++k)
-         {
-            int legOut = OlderIndex(iCls, k, series);
-            if(!IndexInWindow(legOut, winOldest, winNewest, series))
-               break;
+      if(!OnlySwingLow)
+         CheckAndProcessTLBreakAtBar(true, tlHigh, time, open, high, low, close, iCls, series, g_high_lastBreak);
 
-            Zone z;
-            if(!BuildZoneFromLegOut(time, open, high, low, close,
-                                    legOut, iCls, iCur, series, winOldest, winNewest,
-                                    z))
-               continue;
+      if(!OnlySwingHigh)
+         CheckAndProcessTLBreakAtBar(false, tlLow, time, open, high, low, close, iCls, series, g_low_lastBreak);
 
-            // ignore zones older than window (extra safety)
-            if(z.tStart < oldestAllowed)
-               continue;
+      // Draw current TL objects for visibility
+      DrawCurrentTrendlines(time, high, low, rates_total, series, iCls);
 
-            // skip if already known
-            if(FindZoneByName(z.name, zonesActive) >= 0) continue;
-            if(FindZoneByName(z.name, zonesDead)   >= 0) continue;
-
-            int n = ArraySize(newFound);
-            ArrayResize(newFound, n + 1);
-            newFound[n] = z;
-         }
-
-         // IMPORTANT FIX: process zones oldest->newest so confirmation works
-         SortZonesByLegOutTimeAsc(newFound);
-
-         // 3) For each new zone in chronological order:
-         //    - confirm it if its leg-out move takes out opposing active zones
-         //    - add it to active/dead
-         for(int i = 0; i < ArraySize(newFound); ++i)
-         {
-            // confirm only if it's not already eliminated
-            ApplyConfirmationOnNewZone(newFound[i], time, high, low, series, winOldest, winNewest, iCls);
-
-            if(newFound[i].status == Eliminated)
-            {
-               MoveToDead(newFound[i]);
-            }
-            else
-            {
-               int n = ArraySize(zonesActive);
-               ArrayResize(zonesActive, n + 1);
-               zonesActive[n] = newFound[i];
-            }
-
-            // opposing zones may have been eliminated by confirmation
-            SweepEliminatedFromActive();
-         }
-      }
-
-      // 4) Draw/update zones
-      for(int i = 0; i < ArraySize(zonesActive); ++i)
-         DrawZone(zonesActive[i]);
-
-      if(InpShowEliminated)
-      {
-         for(int i = 0; i < ArraySize(zonesDead); ++i)
-            DrawZone(zonesDead[i]);
-      }
-      else
-      {
-         for(int i = 0; i < ArraySize(zonesDead); ++i)
-            DeleteObjectExact(zonesDead[i].name);
-      }
+      // 4) Draw zones
+      for(int i=0; i<ArraySize(zonesActive); ++i) DrawZone(zonesActive[i]);
+      for(int i=0; i<ArraySize(zonesDead);   ++i) DrawZone(zonesDead[i]);
    }
    else
    {
-      // same-bar ticks: extend active zones visually to now (cheap updates)
-      for(int i = 0; i < ArraySize(zonesActive); ++i)
+      // Same bar ticks: just extend active zones visually
+      for(int i=0; i<ArraySize(zonesActive); ++i)
       {
          if(zonesActive[i].status != Eliminated)
          {
