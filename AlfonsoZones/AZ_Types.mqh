@@ -34,6 +34,12 @@ struct TLInfo
    datetime t1, t2;
    double   p1, p2;
 
+   // Anchor points in "natural" candle index space (NS):
+   // NS increases from oldest -> newest and is stable regardless of series arrays.
+   // Used for index-based trendline price math (immune to weekend time gaps).
+   int      ns1;   // older swing point (NS index)
+   int      ns2;   // newer swing point (NS index)
+
    int      swing_ns;
    datetime swingTime;
 

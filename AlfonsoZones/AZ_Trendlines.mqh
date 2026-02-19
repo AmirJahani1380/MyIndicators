@@ -185,6 +185,8 @@ void ComputeTrendlineAt(AZState &st,
    out.has = false;
    out.t1 = out.t2 = 0;
    out.p1 = out.p2 = 0.0;
+   out.ns1 = -1;
+   out.ns2 = -1;
    out.swing_ns = -1;
    out.swingTime = 0;
    out.idx_old_arr = -1;
@@ -227,6 +229,9 @@ void ComputeTrendlineAt(AZState &st,
       double tp = older_px; older_px = newer_px; newer_px = tp;
    }
 
+
+   // only draw when swing distance >= SwingPeriod (in candles)
+   if((newer_idx - older_idx) < SwingPeriod) return;
    // enforce correct slope direction
    if(!isHigh)
    {
@@ -290,6 +295,8 @@ void ComputeTrendlineAt(AZState &st,
    out.has = true;
    out.t1 = t[aold]; out.p1 = older_px;
    out.t2 = t[anew]; out.p2 = newer_px;
+   out.ns1 = older_idx;
+   out.ns2 = newer_idx;
    out.swing_ns = newer_idx;
    out.swingTime = t[anew];
    out.idx_old_arr = aold;
@@ -345,12 +352,12 @@ void DrawCurrentTrendlines(AZState &st,
 }
 
 //------------------------- Line math + break tests -------------------
-double LinePriceAt(datetime t, datetime t1, double p1, datetime t2, double p2)
+double LinePriceAt(const int ns_t, const int ns1, const double p1, const int ns2, const double p2)
 {
-   long dt = (long)(t2 - t1);
-   if(dt == 0) return p2;
-   double slope = (p2 - p1) / (double)dt;
-   return p1 + slope * (double)((long)(t - t1));
+   int di = (ns2 - ns1);
+   if(di == 0) return p2;
+   double slope = (p2 - p1) / (double)di;
+   return p1 + slope * (double)(ns_t - ns1);
 }
 
 datetime CandleCloseTime(const datetime &timeOpen)
@@ -360,20 +367,30 @@ datetime CandleCloseTime(const datetime &timeOpen)
 
 // “full OHLC” reduces to single extreme test
 bool FullOHLC_AboveLine(const datetime &time[], const double &low[],
-                        const int i, datetime t1,double p1, datetime t2,double p2)
+                        const int i, const int ns1,double p1, const int ns2,double p2)
 {
-   datetime tClose = CandleCloseTime(time[i]);
-   double lp = LinePriceAt(tClose, t1, p1, t2, p2);
-   double eps = _Point * 0.5;
+   const int rates_total = ArraySize(time);
+   const bool seriesArrays = (rates_total > 1 && time[0] > time[rates_total-1]);
+
+   // evaluate line at candle close => +1 candle step in NS space
+   const int nsClose = MapArr2NS(i, rates_total, seriesArrays) + 1;
+
+   const double lp = LinePriceAt(nsClose, ns1, p1, ns2, p2);
+   const double eps = _Point * 0.5;
    return (low[i] > lp + eps);
 }
 
 bool FullOHLC_BelowLine(const datetime &time[], const double &high[],
-                        const int i, datetime t1,double p1, datetime t2,double p2)
+                        const int i, const int ns1,double p1, const int ns2,double p2)
 {
-   datetime tClose = CandleCloseTime(time[i]);
-   double lp = LinePriceAt(tClose, t1, p1, t2, p2);
-   double eps = _Point * 0.5;
+   const int rates_total = ArraySize(time);
+   const bool seriesArrays = (rates_total > 1 && time[0] > time[rates_total-1]);
+
+   // evaluate line at candle close => +1 candle step in NS space
+   const int nsClose = MapArr2NS(i, rates_total, seriesArrays) + 1;
+
+   const double lp = LinePriceAt(nsClose, ns1, p1, ns2, p2);
+   const double eps = _Point * 0.5;
    return (high[i] < lp - eps);
 }
 
@@ -386,7 +403,12 @@ void DrawBrokenTrendlineSegment(const bool breakOnHighLine,
    if(!tl.has) return;
 
    datetime tEnd = time[breakBarIdx];
-   double   pEnd = LinePriceAt(tEnd, tl.t1, tl.p1, tl.t2, tl.p2);
+
+   const int rates_total = ArraySize(time);
+   const bool seriesArrays = (rates_total > 1 && time[0] > time[rates_total-1]);
+   const int nsEnd = MapArr2NS(breakBarIdx, rates_total, seriesArrays);
+
+   double   pEnd = LinePriceAt(nsEnd, tl.ns1, tl.p1, tl.ns2, tl.p2);
 
    string nm = BrokenTLObjName(breakOnHighLine, time[breakBarIdx]);
 
@@ -399,12 +421,15 @@ bool ZoneTouchesLineWick(const Zone &z,
                          const datetime &time[],
                          const double &high[], const double &low[],
                          const bool series,
-                         datetime t1,double p1, datetime t2,double p2)
+                         const int ns1,double p1, const int ns2,double p2)
 {
+   const int rates_total = ArraySize(time);
+
    int idx = z.baseStart;
    while(true)
    {
-      double lp = LinePriceAt(time[idx], t1, p1, t2, p2);
+      const int ns = MapArr2NS(idx, rates_total, series);
+      double lp = LinePriceAt(ns, ns1, p1, ns2, p2);
       if(low[idx] <= lp && high[idx] >= lp)
          return true;
 
@@ -421,24 +446,28 @@ void ConfirmZonesByTLBreak(AZState &st,
                            const datetime &time[],
                            const double &high[], const double &low[],
                            const bool series,
-                           datetime t1,double p1, datetime t2,double p2)
+                           const int ns1,double p1, const int ns2,double p2)
 {
    if(breakTime <= 0 || swingTime <= 0) return;
 
    ZoneType toConfirm = breakOnHighLine ? Demand : Supply;
 
+   // Normalize window [a..b]
    datetime a = swingTime;
    datetime b = breakTime;
    if(b < a){ datetime tmp=a; a=b; b=tmp; }
 
+   // 1) Find EXTREME zone (same rule as before)
    int extremeIdx = -1;
    double extremeDistal = (toConfirm==Demand ? DBL_MAX : -DBL_MAX);
 
    for(int i=0; i<ArraySize(st.zonesActive); ++i)
    {
       if(st.zonesActive[i].status != Potential) continue;
-      if(st.zonesActive[i].type != toConfirm) continue;
-      if(st.zonesActive[i].tStart > b) continue;
+      if(st.zonesActive[i].type   != toConfirm) continue;
+
+      // must overlap swing->break window
+      if(st.zonesActive[i].tStart   > b) continue;
       if(st.zonesActive[i].tBaseEnd < a) continue;
 
       if(toConfirm == Demand)
@@ -459,30 +488,46 @@ void ConfirmZonesByTLBreak(AZState &st,
       }
    }
 
+   // 2) Find LAST touching zone (most recent base that touches the trendline before break)
+   //    "Last" = greatest tBaseEnd (closest to breakTime), but still inside window.
+   int touchIdx = -1;
+   datetime bestBaseEnd = 0;
+
    for(int i=0; i<ArraySize(st.zonesActive); ++i)
    {
       if(st.zonesActive[i].status != Potential) continue;
-      if(st.zonesActive[i].type != toConfirm) continue;
-      if(st.zonesActive[i].tStart > b) continue;
+      if(st.zonesActive[i].type   != toConfirm) continue;
+
+      // must overlap swing->break window
+      if(st.zonesActive[i].tStart   > b) continue;
       if(st.zonesActive[i].tBaseEnd < a) continue;
 
-      if(ZoneTouchesLineWick(st.zonesActive[i], time, high, low, series, t1,p1,t2,p2))
+      // defensive: ignore bases ending after break
+      if(st.zonesActive[i].tBaseEnd > b) continue;
+
+      // base touches the line (wick touch anywhere during base candles)
+      if(!ZoneTouchesLineWick(st.zonesActive[i], time, high, low, series, ns1, p1, ns2, p2))
+         continue;
+
+      if(touchIdx < 0 || st.zonesActive[i].tBaseEnd > bestBaseEnd)
       {
-         st.zonesActive[i].status = Confirmed;
-         st.zonesActive[i].tConfirmed    = breakTime;
-         st.zonesActive[i].confirmReason = breakOnHighLine
-                                        ? "TRENDLINE_BREAK (touch -> Demand)"
-                                        : "TRENDLINE_BREAK (touch -> Supply)";
+         touchIdx = i;
+         bestBaseEnd = st.zonesActive[i].tBaseEnd;
       }
    }
 
-   if(extremeIdx >= 0 && st.zonesActive[extremeIdx].status == Potential)
+   // 3) Confirm LAST touching zone (if found)
+   if(touchIdx >= 0)
+   {
+      st.zonesActive[touchIdx].status = Confirmed;
+      st.zonesActive[touchIdx].tConfirmed = breakTime;
+   }
+
+   // 4) Confirm EXTREME zone too (if found and not already the touching zone)
+   if(extremeIdx >= 0 && extremeIdx != touchIdx)
    {
       st.zonesActive[extremeIdx].status = Confirmed;
-      st.zonesActive[extremeIdx].tConfirmed    = breakTime;
-      st.zonesActive[extremeIdx].confirmReason = breakOnHighLine
-                                             ? "TRENDLINE_BREAK (extreme distal -> Demand)"
-                                             : "TRENDLINE_BREAK (extreme distal -> Supply)";
+      st.zonesActive[extremeIdx].tConfirmed = breakTime;
    }
 }
 
@@ -540,8 +585,8 @@ bool CheckAndProcessTLBreakUpToBar(AZState &st,
          if(time[i] <= lastBreakStore) continue;
 
          bool isBreak = breakOnHighLine
-                        ? FullOHLC_AboveLine(time, low,  i, tl.t1,tl.p1,tl.t2,tl.p2)
-                        : FullOHLC_BelowLine(time, high, i, tl.t1,tl.p1,tl.t2,tl.p2);
+                        ? FullOHLC_AboveLine(time, low,  i, tl.ns1,tl.p1, tl.ns2,tl.p2)
+                        : FullOHLC_BelowLine(time, high, i, tl.ns1,tl.p1, tl.ns2,tl.p2);
 
          if(isBreak){ breakIdx = i; break; }
       }
@@ -558,8 +603,8 @@ bool CheckAndProcessTLBreakUpToBar(AZState &st,
          if(time[i] <= lastBreakStore) continue;
 
          bool isBreak = breakOnHighLine
-                        ? FullOHLC_AboveLine(time, low,  i, tl.t1,tl.p1,tl.t2,tl.p2)
-                        : FullOHLC_BelowLine(time, high, i, tl.t1,tl.p1,tl.t2,tl.p2);
+                        ? FullOHLC_AboveLine(time, low,  i, tl.ns1,tl.p1, tl.ns2,tl.p2)
+                        : FullOHLC_BelowLine(time, high, i, tl.ns1,tl.p1, tl.ns2,tl.p2);
 
          if(isBreak){ breakIdx = i; break; }
       }
@@ -580,7 +625,7 @@ bool CheckAndProcessTLBreakUpToBar(AZState &st,
                          breakOnHighLine,
                          tl.swingTime, breakTime,
                          time, high, low, series,
-                         tl.t1,tl.p1,tl.t2,tl.p2);
+                         tl.ns1,tl.p1, tl.ns2,tl.p2);
 
    return true;
 }
