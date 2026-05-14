@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
-//|                                               Backtesting BO.mq5   |
-//|  Semi-automatic breakout annotation and CSV export indicator.      |
+//|                                               Backtesting BO.mq5  |
+//|  Semi-automatic breakout annotation and CSV export indicator.     |
 //+------------------------------------------------------------------+
 #property indicator_chart_window
 #property indicator_plots   1
@@ -42,14 +42,22 @@ input bool     InpUseCommonFiles     = false;    // Export to common Files folde
 input bool     InpShowPanel          = true;     // Show annotation panel
 input int      InpPanelX             = 10;       // Panel X position
 input int      InpPanelY             = 20;       // Panel Y position
-input int      InpPanelWidth         = 620;      // Panel width
-input int      InpPanelHeight        = 620;      // Panel height
+input int      InpPanelWidth         = 590;      // Panel width
+input int      InpPanelHeight        = 505;      // Panel height
 input color    InpPanelBgColor       = clrWhiteSmoke;
 input color    InpPanelBorderColor   = clrSilver;
 input color    InpEditBgColor        = clrWhite;
 input color    InpEditTextColor      = clrBlack;
 input string   InpUIFont            = "Arial";  // Panel font
 input int      InpUIFontSize         = 8;        // Panel font size
+
+// Separate rows window settings.
+input int      InpRowsWindowX        = 630;      // Rows window X position
+input int      InpRowsWindowY        = 20;       // Rows window Y position
+input int      InpRowsWindowWidth    = 760;      // Rows window width
+input int      InpRowsWindowHeight   = 430;      // Rows window height
+input int      InpRowsVisibleCols    = 6;        // Visible table columns in rows window
+input int      InpMouseWheelRowsStep = 3;        // Rows moved per mouse wheel step
 
 // Selected candle color. Selected BO and FT candles are drawn with DRAW_COLOR_CANDLES.
 input color    InpSelectedCandleColor = clrDarkViolet;
@@ -95,12 +103,62 @@ enum PanelTab
    TAB_ROWS = 1
 };
 
+enum RowsDragKind
+{
+   ROWS_DRAG_NONE = 0,
+   ROWS_DRAG_WINDOW,
+   ROWS_DRAG_VSCROLL,
+   ROWS_DRAG_HSCROLL
+};
+
 SelectMode g_mode = MODE_NONE;
 PanelTab   g_tab  = TAB_FORM;
 int        g_leg_click_step = 0;
 bool       g_ignore_next_chart_click = false;
 int        g_row_offset = 0;
 int        g_col_offset = 0;
+
+bool g_rows_window_visible = false;
+RowsDragKind g_rows_drag_kind = ROWS_DRAG_NONE;
+int  g_rows_window_x = 0;
+int  g_rows_window_y = 0;
+int  g_rows_drag_offset_x = 0;
+int  g_rows_drag_offset_y = 0;
+int  g_last_mouse_x = 0;
+int  g_last_mouse_y = 0;
+
+int  g_rows_visible_rows = 1;
+int  g_rows_visible_cols = 1;
+int  g_rows_table_x = 0;
+int  g_rows_table_y = 0;
+int  g_rows_table_w = 0;
+int  g_rows_table_h = 0;
+int  g_rows_vtrack_x = 0;
+int  g_rows_vtrack_y = 0;
+int  g_rows_vtrack_w = 0;
+int  g_rows_vtrack_h = 0;
+int  g_rows_vthumb_x = 0;
+int  g_rows_vthumb_y = 0;
+int  g_rows_vthumb_w = 0;
+int  g_rows_vthumb_h = 0;
+int  g_rows_htrack_x = 0;
+int  g_rows_htrack_y = 0;
+int  g_rows_htrack_w = 0;
+int  g_rows_htrack_h = 0;
+int  g_rows_hthumb_x = 0;
+int  g_rows_hthumb_y = 0;
+int  g_rows_hthumb_w = 0;
+int  g_rows_hthumb_h = 0;
+
+bool g_chart_mouse_scroll_initial = true;
+bool g_chart_mouse_scroll_current = true;
+
+#define KEY_PGUP   33
+#define KEY_PGDN   34
+#define KEY_LEFT   37
+#define KEY_UP     38
+#define KEY_RIGHT  39
+#define KEY_DOWN   40
 
 bool     g_has_bo = false;
 bool     g_has_ft = false;
@@ -132,7 +190,7 @@ int      g_swing_period = -1;
 string   g_rows[];
 int      g_saved_count = 0;
 
-// Form state is stored here so switching tabs does not erase input text.
+// Form state is stored here so switching/rebuilding UI does not erase input text.
 string g_export_name;
 string g_break_out_of_what = "";
 string g_pattern = "";
@@ -346,6 +404,43 @@ bool GetBufferValue(int handle, int shift, double &value)
    return true;
 }
 
+bool PointInRect(const int px, const int py, const int x, const int y, const int w, const int h)
+{
+   return (px >= x && px <= x + w && py >= y && py <= y + h);
+}
+
+bool MainPanelHitXY(const int px, const int py)
+{
+   if(!InpShowPanel)
+      return false;
+
+   return PointInRect(px, py, InpPanelX, InpPanelY, InpPanelWidth, InpPanelHeight);
+}
+
+void SetChartMouseScrollState(const bool enabled)
+{
+   if(g_chart_mouse_scroll_current == enabled)
+      return;
+
+   ChartSetInteger(0, CHART_MOUSE_SCROLL, enabled);
+   g_chart_mouse_scroll_current = enabled;
+}
+
+void UpdateChartMouseScrollProtection(const int px, const int py, const bool left_down)
+{
+   bool over_rows_window = false;
+   if(g_rows_window_visible)
+      over_rows_window = PointInRect(px, py, g_rows_window_x, g_rows_window_y,
+                                     InpRowsWindowWidth, InpRowsWindowHeight);
+
+   bool over_ui = MainPanelHitXY(px, py) || over_rows_window || g_rows_drag_kind != ROWS_DRAG_NONE;
+
+   if(over_ui || (left_down && g_rows_drag_kind != ROWS_DRAG_NONE))
+      SetChartMouseScrollState(false);
+   else
+      SetChartMouseScrollState(g_chart_mouse_scroll_initial);
+}
+
 //----------------------------- Candle metrics ----------------------
 string CandleDirection(int shift)
 {
@@ -466,6 +561,30 @@ void MakeLabel(const string name, int x, int y, int w, const string text, color 
    ApplyTextStyle(obj);
 }
 
+void MakeRect(const string name,
+              int x,
+              int y,
+              int w,
+              int h,
+              color bg_color,
+              color border_color,
+              bool selectable = false)
+{
+   string obj = Obj(name);
+   ObjectDelete(0, obj);
+   ObjectCreate(0, obj, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, obj, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, obj, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, obj, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, obj, OBJPROP_XSIZE, w);
+   ObjectSetInteger(0, obj, OBJPROP_YSIZE, h);
+   ObjectSetInteger(0, obj, OBJPROP_BGCOLOR, bg_color);
+   ObjectSetInteger(0, obj, OBJPROP_COLOR, border_color);
+   ObjectSetInteger(0, obj, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, obj, OBJPROP_SELECTABLE, selectable);
+   ObjectSetInteger(0, obj, OBJPROP_BACK, false);
+}
+
 void MakeButton(const string name, int x, int y, int w, int h, const string text)
 {
    string obj = Obj(name);
@@ -479,8 +598,22 @@ void MakeButton(const string name, int x, int y, int w, int h, const string text
    ObjectSetInteger(0, obj, OBJPROP_COLOR, clrBlack);
    ObjectSetInteger(0, obj, OBJPROP_BGCOLOR, clrWhite);
    ObjectSetInteger(0, obj, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, obj, OBJPROP_STATE, false);
    ObjectSetString(0, obj, OBJPROP_TEXT, text);
    ApplyTextStyle(obj);
+}
+
+void ResetButtonState(const string obj_name)
+{
+   if(ObjectFind(0, obj_name) < 0)
+      return;
+
+   long type = ObjectGetInteger(0, obj_name, OBJPROP_TYPE);
+   if(type != OBJ_BUTTON)
+      return;
+
+   ObjectSetInteger(0, obj_name, OBJPROP_STATE, false);
+   ChartRedraw(0);
 }
 
 void MakeEdit(const string name, int x, int y, int w, int h, const string text)
@@ -571,26 +704,16 @@ void CreatePanelBase()
    int w = InpPanelWidth;
    int h = InpPanelHeight;
 
-   string bg = Obj("PANEL_BG");
-   ObjectDelete(0, bg);
-   ObjectCreate(0, bg, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, bg, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-   ObjectSetInteger(0, bg, OBJPROP_XDISTANCE, x);
-   ObjectSetInteger(0, bg, OBJPROP_YDISTANCE, y);
-   ObjectSetInteger(0, bg, OBJPROP_XSIZE, w);
-   ObjectSetInteger(0, bg, OBJPROP_YSIZE, h);
-   ObjectSetInteger(0, bg, OBJPROP_BGCOLOR, InpPanelBgColor);
-   ObjectSetInteger(0, bg, OBJPROP_COLOR, InpPanelBorderColor);
-   ObjectSetInteger(0, bg, OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, bg, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, bg, OBJPROP_BACK, false);
+   MakeRect("PANEL_BG", x, y, w, h, InpPanelBgColor, InpPanelBorderColor);
 
    MakeLabel("TITLE", x + 10, y + 8, w - 60, "Backtesting BO", clrBlack);
    MakeButton("BTN_CLOSE", x + w - 32, y + 5, 22, 20, "X");
-   MakeButton("BTN_TAB_FORM", x + 10, y + 34, 80, 22, "Form");
-   MakeButton("BTN_TAB_ROWS", x + 95, y + 34, 80, 22, "Rows");
-   MakeLabel("MODE",  x + 185, y + 37, w - 195, "Mode: NONE", clrDarkBlue);
-   MakeLabel("STATUS",x + 10, y + 60, w - 20, "Saved rows: 0", clrDimGray);
+
+   MakeButton("BTN_TAB_FORM", x + 10,  y + 34, 90, 22, "Input Form");
+   MakeButton("BTN_TAB_ROWS", x + 105, y + 34, 95, 22, "Open Rows");
+
+   MakeLabel("MODE",  x + 210, y + 37, w - 220, "Mode: NONE", clrDarkBlue);
+   MakeLabel("STATUS",x + 10,  y + 60, w - 20, "Saved rows: 0", clrDimGray);
 }
 
 void CreateFormTab()
@@ -598,67 +721,75 @@ void CreateFormTab()
    int x = InpPanelX;
    int y = InpPanelY;
 
-   int by = y + 86;
-   MakeButton("FORM_BTN_BO",       x + 10,  by, 70, 22, "B: BO");
-   MakeButton("FORM_BTN_FT",       x + 85,  by, 70, 22, "F: FT");
-   MakeButton("FORM_BTN_POINT",    x + 160, by, 70, 22, "P: Point");
-   MakeButton("FORM_BTN_LEG",      x + 235, by, 80, 22, "L: Leg/PB");
-   MakeButton("FORM_BTN_SWING",    x + 320, by, 85, 22, "S: Swing");
+   int edit_x = x + 155;
+   int edit_w = InpPanelWidth - 170;
+   if(edit_w < 150)
+      edit_w = 150;
 
-   by += 28;
-   MakeButton("FORM_BTN_SAVE",     x + 10,  by, 100, 24, "Save Event");
-   MakeButton("FORM_BTN_EXPORT",   x + 115, by, 100, 24, "Export CSV");
-   MakeButton("FORM_BTN_NEW",      x + 220, by, 90, 24, "New File");
-   MakeButton("FORM_BTN_CLEAR",    x + 315, by, 90, 24, "Clear Sel.");
+   int by = y + 78;
 
-   by += 34;
-   MakeLabel("FORM_LBL_EXPORT", x + 10, by, 110, "Export name");
-   MakeEdit("FORM_EDIT_EXPORT_NAME", x + 120, by - 3, 455, 20, g_export_name);
+   MakeButton("FORM_BTN_BO",       x + 10,  by, 64, 20, "B: BO");
+   MakeButton("FORM_BTN_FT",       x + 78,  by, 64, 20, "F: FT");
+   MakeButton("FORM_BTN_POINT",    x + 146, by, 74, 20, "P: Point");
+   MakeButton("FORM_BTN_LEG",      x + 224, by, 78, 20, "L: Leg/PB");
+   MakeButton("FORM_BTN_SWING",    x + 306, by, 82, 20, "S: Swing");
+
+   by += 26;
+   MakeButton("FORM_BTN_SAVE",     x + 10,  by, 98, 22, "Save Event");
+   MakeButton("FORM_BTN_EXPORT",   x + 112, by, 98, 22, "Export CSV");
+   MakeButton("FORM_BTN_NEW",      x + 214, by, 88, 22, "New File");
+   MakeButton("FORM_BTN_CLEAR",    x + 306, by, 88, 22, "Clear Sel.");
 
    by += 30;
-   MakeLabel("FORM_LBL_WHAT", x + 10, by, 150, "Break out of what");
-   MakeEdit("FORM_EDIT_BREAK_OUT_OF_WHAT", x + 160, by - 3, 415, 20, g_break_out_of_what);
+   MakeLabel("FORM_LBL_EXPORT", x + 10, by, 140, "Export name");
+   MakeEdit("FORM_EDIT_EXPORT_NAME", edit_x, by - 3, edit_w, 20, g_export_name);
 
-   by += 28;
-   MakeLabel("FORM_LBL_PATTERN", x + 10, by, 150, "Pattern");
-   MakeEdit("FORM_EDIT_PATTERN", x + 160, by - 3, 415, 20, g_pattern);
+   by += 26;
+   MakeLabel("FORM_LBL_WHAT", x + 10, by, 140, "Break out of what");
+   MakeEdit("FORM_EDIT_BREAK_OUT_OF_WHAT", edit_x, by - 3, edit_w, 20, g_break_out_of_what);
 
-   by += 28;
-   MakeLabel("FORM_LBL_PB", x + 10, by, 150, "BO from pullback");
-   MakeEdit("FORM_EDIT_FROM_PULLBACK", x + 160, by - 3, 415, 20, g_from_pullback);
+   by += 26;
+   MakeLabel("FORM_LBL_PATTERN", x + 10, by, 140, "Pattern");
+   MakeEdit("FORM_EDIT_PATTERN", edit_x, by - 3, edit_w, 20, g_pattern);
 
-   by += 28;
-   MakeLabel("FORM_LBL_LEGCOUNT", x + 10, by, 150, "At what leg");
-   MakeEdit("FORM_EDIT_AT_LEG", x + 160, by - 3, 415, 20, g_at_leg);
+   by += 26;
+   MakeLabel("FORM_LBL_PB", x + 10, by, 140, "BO from pullback");
+   MakeEdit("FORM_EDIT_FROM_PULLBACK", edit_x, by - 3, edit_w, 20, g_from_pullback);
 
-   by += 28;
-   MakeLabel("FORM_LBL_HTF", x + 10, by, 150, "HTF location");
-   MakeEdit("FORM_EDIT_HTF_LOCATION", x + 160, by - 3, 415, 20, g_htf_location);
+   by += 26;
+   MakeLabel("FORM_LBL_LEGCOUNT", x + 10, by, 140, "At what leg");
+   MakeEdit("FORM_EDIT_AT_LEG", edit_x, by - 3, edit_w, 20, g_at_leg);
 
-   by += 28;
-   MakeLabel("FORM_LBL_CONDITION", x + 10, by, 150, "Market condition");
-   MakeEdit("FORM_EDIT_MARKET_CONDITION", x + 160, by - 3, 415, 20, g_market_condition);
+   by += 26;
+   MakeLabel("FORM_LBL_HTF", x + 10, by, 140, "HTF location");
+   MakeEdit("FORM_EDIT_HTF_LOCATION", edit_x, by - 3, edit_w, 20, g_htf_location);
 
-   by += 28;
-   MakeLabel("FORM_LBL_DIRECTION", x + 10, by, 150, "Market direction");
-   MakeEdit("FORM_EDIT_MARKET_DIRECTION", x + 160, by - 3, 415, 20, g_market_direction);
+   by += 26;
+   MakeLabel("FORM_LBL_CONDITION", x + 10, by, 140, "Market condition");
+   MakeEdit("FORM_EDIT_MARKET_CONDITION", edit_x, by - 3, edit_w, 20, g_market_condition);
 
-   by += 28;
-   MakeLabel("FORM_LBL_FTCOUNT", x + 10, by, 150, "# FT before first PB");
-   MakeEdit("FORM_EDIT_FT_BEFORE_PB", x + 160, by - 3, 415, 20, g_ft_before_pb);
+   by += 26;
+   MakeLabel("FORM_LBL_DIRECTION", x + 10, by, 140, "Market direction");
+   MakeEdit("FORM_EDIT_MARKET_DIRECTION", edit_x, by - 3, edit_w, 20, g_market_direction);
 
-   by += 28;
-   MakeLabel("FORM_LBL_SCREEN", x + 10, by, 150, "Screenshot path");
-   MakeEdit("FORM_EDIT_SCREENSHOT", x + 160, by - 3, 415, 20, g_screenshot_path);
+   by += 26;
+   MakeLabel("FORM_LBL_FTCOUNT", x + 10, by, 140, "# FT before first PB");
+   MakeEdit("FORM_EDIT_FT_BEFORE_PB", edit_x, by - 3, edit_w, 20, g_ft_before_pb);
 
-   by += 28;
-   MakeLabel("FORM_LBL_NOTE", x + 10, by, 150, "Note");
-   MakeEdit("FORM_EDIT_NOTE", x + 160, by - 3, 415, 48, g_note);
+   by += 26;
+   MakeLabel("FORM_LBL_SCREEN", x + 10, by, 140, "Screenshot path");
+   MakeEdit("FORM_EDIT_SCREENSHOT", edit_x, by - 3, edit_w, 20, g_screenshot_path);
 
-   by += 62;
-   MakeLabel("FORM_HELP1", x + 10, by, InpPanelWidth - 20, "Click modes: B=BO, F=FT, P=breakout price, L=leg start/end/PB end, S=swing.", clrDimGray);
-   by += 18;
-   MakeLabel("FORM_HELP2", x + 10, by, InpPanelWidth - 20, "Manual fields may be blank. Multi-label fields can be comma-separated.", clrDimGray);
+   by += 26;
+   MakeLabel("FORM_LBL_NOTE", x + 10, by, 140, "Note");
+   MakeEdit("FORM_EDIT_NOTE", edit_x, by - 3, edit_w, 42, g_note);
+
+   by += 54;
+   MakeLabel("FORM_HELP1", x + 10, by, InpPanelWidth - 20,
+             "Click modes: B=BO, F=FT, P=breakout price, L=leg start/end/PB end, S=swing.", clrDimGray);
+   by += 16;
+   MakeLabel("FORM_HELP2", x + 10, by, InpPanelWidth - 20,
+             "Open Rows shows a separate draggable table window with scrollbars.", clrDimGray);
 }
 
 string FieldAtCsvIndex(const string row, int wanted)
@@ -697,98 +828,565 @@ string FieldAtCsvIndex(const string row, int wanted)
    return out;
 }
 
-void CreateRowsTab()
+//----------------------------- Rows floating window ----------------
+void DeleteRowsWindowObjects()
 {
-   int x = InpPanelX;
-   int y = InpPanelY;
-   int by = y + 88;
+   DeleteObjectsContaining("ROWSWIN_");
+}
 
-   MakeButton("ROW_BTN_EXPORT", x + 10, by, 100, 24, "Export CSV");
-   MakeButton("ROW_BTN_NEW", x + 115, by, 90, 24, "New File");
-   MakeButton("ROW_BTN_UP", x + 210, by, 34, 24, "Up");
-   MakeButton("ROW_BTN_DN", x + 248, by, 34, 24, "Dn");
-   MakeButton("ROW_BTN_LEFT", x + 286, by, 40, 24, "Left");
-   MakeButton("ROW_BTN_RIGHT", x + 330, by, 45, 24, "Right");
-   MakeLabel("ROW_COUNT", x + 385, by + 4, 220, "Rows: " + IntegerToString(g_saved_count), clrBlack);
+bool RowsWindowHit(const int px, const int py)
+{
+   if(!g_rows_window_visible)
+      return false;
 
-   by += 34;
+   return PointInRect(px, py, g_rows_window_x, g_rows_window_y,
+                      InpRowsWindowWidth, InpRowsWindowHeight);
+}
+
+bool RowsWindowTitleHit(const int px, const int py)
+{
+   if(!g_rows_window_visible)
+      return false;
+
+   return PointInRect(px, py, g_rows_window_x, g_rows_window_y,
+                      InpRowsWindowWidth - 42, 28);
+}
+
+bool RowsVThumbHit(const int px, const int py)
+{
+   return PointInRect(px, py, g_rows_vthumb_x, g_rows_vthumb_y,
+                      g_rows_vthumb_w, g_rows_vthumb_h);
+}
+
+bool RowsHThumbHit(const int px, const int py)
+{
+   return PointInRect(px, py, g_rows_hthumb_x, g_rows_hthumb_y,
+                      g_rows_hthumb_w, g_rows_hthumb_h);
+}
+
+bool RowsVTrackHit(const int px, const int py)
+{
+   return PointInRect(px, py, g_rows_vtrack_x, g_rows_vtrack_y,
+                      g_rows_vtrack_w, g_rows_vtrack_h);
+}
+
+bool RowsHTrackHit(const int px, const int py)
+{
+   return PointInRect(px, py, g_rows_htrack_x, g_rows_htrack_y,
+                      g_rows_htrack_w, g_rows_htrack_h);
+}
+
+string ShortCellText(const string text, const int cell_width)
+{
+   int max_chars = (cell_width - 8) / 7;
+   if(max_chars < 4)
+      max_chars = 4;
+
+   if(StringLen(text) <= max_chars)
+      return text;
+
+   if(max_chars <= 3)
+      return StringSubstr(text, 0, max_chars);
+
+   return StringSubstr(text, 0, max_chars - 3) + "...";
+}
+
+void ClampRowsOffsets(const int visible_rows, const int visible_cols)
+{
+   int total_cols = 47;
+
+   if(g_col_offset < 0)
+      g_col_offset = 0;
+
+   int max_col = MathMax(0, total_cols - visible_cols);
+   if(g_col_offset > max_col)
+      g_col_offset = max_col;
+
+   if(g_row_offset < 0)
+      g_row_offset = 0;
+
+   int max_row = MathMax(0, g_saved_count - visible_rows);
+   if(g_row_offset > max_row)
+      g_row_offset = max_row;
+}
+
+int ThumbSize(const int track_size, const int visible_count, const int total_count)
+{
+   if(total_count <= 0 || visible_count >= total_count)
+      return track_size;
+
+   int size = (int)MathRound((double)track_size * (double)visible_count / (double)total_count);
+   if(size < 22)
+      size = 22;
+   if(size > track_size)
+      size = track_size;
+   return size;
+}
+
+int ThumbPos(const int track_pos, const int track_size, const int thumb_size,
+             const int offset, const int max_offset)
+{
+   if(max_offset <= 0 || track_size <= thumb_size)
+      return track_pos;
+
+   return track_pos + (int)MathRound((double)(track_size - thumb_size) * (double)offset / (double)max_offset);
+}
+
+int OffsetFromThumb(const int mouse_pos,
+                    const int drag_offset,
+                    const int track_pos,
+                    const int track_size,
+                    const int thumb_size,
+                    const int max_offset)
+{
+   if(max_offset <= 0 || track_size <= thumb_size)
+      return 0;
+
+   int pos = mouse_pos - drag_offset;
+   if(pos < track_pos)
+      pos = track_pos;
+
+   int max_pos = track_pos + track_size - thumb_size;
+   if(pos > max_pos)
+      pos = max_pos;
+
+   return (int)MathRound((double)(pos - track_pos) * (double)max_offset / (double)(track_size - thumb_size));
+}
+
+void CreateRowsWindow()
+{
+   DeleteRowsWindowObjects();
+
+   if(!g_rows_window_visible)
+      return;
+
+   int x = g_rows_window_x;
+   int y = g_rows_window_y;
+   int w = InpRowsWindowWidth;
+   int h = InpRowsWindowHeight;
+
+   if(w < 360)
+      w = 360;
+   if(h < 220)
+      h = 220;
+
+   MakeRect("ROWSWIN_BG", x, y, w, h, InpPanelBgColor, InpPanelBorderColor);
+   MakeRect("ROWSWIN_TITLE_BG", x, y, w, 28, C'230,230,230', InpPanelBorderColor);
+
+   MakeLabel("ROWSWIN_TITLE", x + 10, y + 7, w - 110, "Saved Rows Table", clrBlack);
+   MakeButton("ROWSWIN_BTN_CLOSE", x + w - 32, y + 4, 22, 20, "X");
+
+   MakeButton("ROWSWIN_BTN_EXPORT", x + 10,  y + 34, 100, 22, "Export CSV");
+   MakeButton("ROWSWIN_BTN_NEW",    x + 115, y + 34, 90,  22, "New File");
+   MakeLabel("ROWSWIN_COUNT",       x + 215, y + 38, w - 225,
+             "Rows: " + IntegerToString(g_saved_count), clrBlack);
+
+   int scroll_size = 15;
+   int table_x = x + 10;
+   int table_y = y + 64;
+   int table_w = w - 20 - scroll_size;
+   int table_h = h - 94 - scroll_size;
+
+   if(table_w < 220)
+      table_w = 220;
+   if(table_h < 66)
+      table_h = 66;
 
    int total_cols = 47;
-   int visible_cols = 5;
-   int visible_rows = (InpPanelHeight - (by - y) - 25) / 22 - 1;
+   int visible_cols = InpRowsVisibleCols;
+   if(visible_cols < 1)
+      visible_cols = 1;
+   if(visible_cols > total_cols)
+      visible_cols = total_cols;
+
+   int cell_h = 22;
+   int visible_rows = table_h / cell_h - 1;
    if(visible_rows < 1)
       visible_rows = 1;
 
-   if(g_col_offset < 0) g_col_offset = 0;
-   if(g_col_offset > MathMax(0, total_cols - visible_cols))
-      g_col_offset = MathMax(0, total_cols - visible_cols);
+   g_rows_visible_rows = visible_rows;
+   g_rows_visible_cols = visible_cols;
 
-   if(g_row_offset < 0) g_row_offset = 0;
-   if(g_row_offset > MathMax(0, g_saved_count - visible_rows))
-      g_row_offset = MathMax(0, g_saved_count - visible_rows);
+   ClampRowsOffsets(visible_rows, visible_cols);
 
-   int cell_h = 22;
-   int col0_w = 38;
-   int cell_w = (InpPanelWidth - 20 - col0_w) / visible_cols;
+   int col0_w = 42;
+   int cell_w = (table_w - col0_w) / visible_cols;
+   if(cell_w < 60)
+      cell_w = 60;
 
-   MakeCell("ROW_CELL_H0", x + 10, by, col0_w, cell_h, "#", true);
+   g_rows_table_x = table_x;
+   g_rows_table_y = table_y;
+   g_rows_table_w = table_w;
+   g_rows_table_h = table_h;
+
+   MakeCell("ROWSWIN_CELL_H0", table_x, table_y, col0_w, cell_h, "#", true);
 
    for(int c = 0; c < visible_cols; c++)
    {
       int col_idx = g_col_offset + c;
       if(col_idx >= total_cols)
          break;
+
       string header = FieldAtCsvIndex(HeaderRow(), col_idx);
-      MakeCell("ROW_CELL_H" + IntegerToString(c + 1), x + 10 + col0_w + c * cell_w, by, cell_w, cell_h, header, true);
+      header = ShortCellText(header, cell_w);
+
+      MakeCell("ROWSWIN_CELL_H" + IntegerToString(c + 1),
+               table_x + col0_w + c * cell_w,
+               table_y,
+               cell_w,
+               cell_h,
+               header,
+               true);
    }
 
    for(int r = 0; r < visible_rows; r++)
    {
       int row_idx = g_row_offset + r;
-      int yy = by + cell_h * (r + 1);
       if(row_idx >= g_saved_count)
          break;
 
-      MakeCell("ROW_CELL_R" + IntegerToString(r) + "_N", x + 10, yy, col0_w, cell_h, IntegerToString(row_idx + 1), false);
+      int yy = table_y + cell_h * (r + 1);
+
+      MakeCell("ROWSWIN_CELL_R" + IntegerToString(r) + "_N",
+               table_x,
+               yy,
+               col0_w,
+               cell_h,
+               IntegerToString(row_idx + 1),
+               false);
 
       for(int c = 0; c < visible_cols; c++)
       {
          int col_idx = g_col_offset + c;
          if(col_idx >= total_cols)
             break;
+
          string value = FieldAtCsvIndex(g_rows[row_idx], col_idx);
-         if(StringLen(value) > 18)
-            value = StringSubstr(value, 0, 17) + "...";
-         MakeCell("ROW_CELL_R" + IntegerToString(r) + "_C" + IntegerToString(c),
-                  x + 10 + col0_w + c * cell_w, yy, cell_w, cell_h, value, false);
+         value = ShortCellText(value, cell_w);
+
+         MakeCell("ROWSWIN_CELL_R" + IntegerToString(r) + "_C" + IntegerToString(c),
+                  table_x + col0_w + c * cell_w,
+                  yy,
+                  cell_w,
+                  cell_h,
+                  value,
+                  false);
       }
    }
 
-   MakeLabel("ROW_SCROLL_INFO", x + 10, y + InpPanelHeight - 22, InpPanelWidth - 20,
-             "Row " + IntegerToString(g_saved_count == 0 ? 0 : g_row_offset + 1) + "/" + IntegerToString(g_saved_count) +
-             " | Col " + IntegerToString(g_col_offset + 1) + "/" + IntegerToString(total_cols), clrDimGray);
-}
+   // Vertical scrollbar.
+   g_rows_vtrack_x = table_x + table_w + 2;
+   g_rows_vtrack_y = table_y;
+   g_rows_vtrack_w = scroll_size - 2;
+   g_rows_vtrack_h = table_h;
 
-void RebuildPanel()
-{
-   SaveFormState();
-   ClearDynamicPanelObjects();
-   CreatePanelBase();
-   if(g_tab == TAB_FORM)
-      CreateFormTab();
-   else
-      CreateRowsTab();
-   UpdateModeLabel();
+   int max_row = MathMax(0, g_saved_count - visible_rows);
+   g_rows_vthumb_w = g_rows_vtrack_w;
+   g_rows_vthumb_h = ThumbSize(g_rows_vtrack_h, visible_rows, MathMax(g_saved_count, visible_rows));
+   g_rows_vthumb_x = g_rows_vtrack_x;
+   g_rows_vthumb_y = ThumbPos(g_rows_vtrack_y, g_rows_vtrack_h, g_rows_vthumb_h, g_row_offset, max_row);
+
+   MakeRect("ROWSWIN_VTRACK", g_rows_vtrack_x, g_rows_vtrack_y,
+            g_rows_vtrack_w, g_rows_vtrack_h, C'245,245,245', clrSilver);
+   MakeRect("ROWSWIN_VTHUMB", g_rows_vthumb_x, g_rows_vthumb_y,
+            g_rows_vthumb_w, g_rows_vthumb_h, C'185,185,185', clrGray);
+
+   // Horizontal scrollbar.
+   g_rows_htrack_x = table_x + col0_w;
+   g_rows_htrack_y = table_y + table_h + 2;
+   g_rows_htrack_w = table_w - col0_w;
+   g_rows_htrack_h = scroll_size - 2;
+
+   int max_col = MathMax(0, total_cols - visible_cols);
+   g_rows_hthumb_h = g_rows_htrack_h;
+   g_rows_hthumb_w = ThumbSize(g_rows_htrack_w, visible_cols, total_cols);
+   g_rows_hthumb_x = ThumbPos(g_rows_htrack_x, g_rows_htrack_w, g_rows_hthumb_w, g_col_offset, max_col);
+   g_rows_hthumb_y = g_rows_htrack_y;
+
+   MakeRect("ROWSWIN_HTRACK", g_rows_htrack_x, g_rows_htrack_y,
+            g_rows_htrack_w, g_rows_htrack_h, C'245,245,245', clrSilver);
+   MakeRect("ROWSWIN_HTHUMB", g_rows_hthumb_x, g_rows_hthumb_y,
+            g_rows_hthumb_w, g_rows_hthumb_h, C'185,185,185', clrGray);
+
+   MakeLabel("ROWSWIN_SCROLL_INFO",
+             x + 10,
+             y + h - 24,
+             w - 20,
+             "Mouse wheel: rows | Drag scrollbars: rows/columns | Arrow keys scroll | Drag title bar to move"
+             + " | Row "
+             + IntegerToString(g_saved_count == 0 ? 0 : g_row_offset + 1)
+             + "/"
+             + IntegerToString(g_saved_count)
+             + " | Col "
+             + IntegerToString(g_col_offset + 1)
+             + "/"
+             + IntegerToString(total_cols),
+             clrDimGray);
+
    ChartRedraw(0);
 }
 
-void CreatePanel()
+void RebuildRowsWindow()
 {
-   CreatePanelBase();
-   CreateFormTab();
-   UpdateModeLabel();
+   if(g_rows_window_visible)
+      CreateRowsWindow();
 }
 
+void OpenRowsWindow()
+{
+   SaveFormState();
+
+   if(g_rows_window_x <= 0)
+      g_rows_window_x = InpRowsWindowX;
+   if(g_rows_window_y <= 0)
+      g_rows_window_y = InpRowsWindowY;
+
+   g_rows_window_visible = true;
+   CreateRowsWindow();
+}
+
+void CloseRowsWindow()
+{
+   g_rows_window_visible = false;
+   g_rows_drag_kind = ROWS_DRAG_NONE;
+   DeleteRowsWindowObjects();
+   ChartRedraw(0);
+}
+
+bool ClickInsideRowsWindow(const long &lparam, const double &dparam)
+{
+   int px = (int)lparam;
+   int py = (int)dparam;
+   return RowsWindowHit(px, py);
+}
+
+void ScrollRowsBy(const int row_delta, const int col_delta)
+{
+   g_row_offset += row_delta;
+   g_col_offset += col_delta;
+   ClampRowsOffsets(g_rows_visible_rows, g_rows_visible_cols);
+   RebuildRowsWindow();
+}
+
+bool HandleRowsWindowClick(const long &lparam, const double &dparam)
+{
+   if(!g_rows_window_visible)
+      return false;
+
+   int px = (int)lparam;
+   int py = (int)dparam;
+   g_last_mouse_x = px;
+   g_last_mouse_y = py;
+
+   if(!RowsWindowHit(px, py))
+      return false;
+
+   int page_rows = MathMax(1, g_rows_visible_rows - 1);
+   int page_cols = MathMax(1, g_rows_visible_cols - 1);
+
+   if(RowsVTrackHit(px, py) && !RowsVThumbHit(px, py))
+   {
+      if(py < g_rows_vthumb_y)
+         ScrollRowsBy(-page_rows, 0);
+      else
+         ScrollRowsBy(page_rows, 0);
+      return true;
+   }
+
+   if(RowsHTrackHit(px, py) && !RowsHThumbHit(px, py))
+   {
+      if(px < g_rows_hthumb_x)
+         ScrollRowsBy(0, -page_cols);
+      else
+         ScrollRowsBy(0, page_cols);
+      return true;
+   }
+
+   return true;
+}
+
+bool HandleRowsWindowWheel(const long &lparam, const double &dparam, const string &sparam)
+{
+   if(!g_rows_window_visible)
+      return false;
+
+   if(!RowsWindowHit(g_last_mouse_x, g_last_mouse_y))
+      return false;
+
+   int delta = (int)dparam;
+   if(delta == 0)
+      return true;
+
+   int flags = (int)StringToInteger(sparam);
+   bool horizontal = ((flags & 4) != 0 || (flags & 8) != 0); // usually Shift or Ctrl
+
+   if(horizontal)
+   {
+      if(delta > 0)
+         ScrollRowsBy(0, -1);
+      else
+         ScrollRowsBy(0, 1);
+   }
+   else
+   {
+      int step = InpMouseWheelRowsStep;
+      if(step < 1)
+         step = 1;
+
+      if(delta > 0)
+         ScrollRowsBy(-step, 0);
+      else
+         ScrollRowsBy(step, 0);
+   }
+
+   return true;
+}
+
+bool HandleRowsWindowKey(const int key)
+{
+   if(!g_rows_window_visible)
+      return false;
+
+   if(key == KEY_UP)
+   {
+      ScrollRowsBy(-1, 0);
+      return true;
+   }
+   if(key == KEY_DOWN)
+   {
+      ScrollRowsBy(1, 0);
+      return true;
+   }
+   if(key == KEY_LEFT)
+   {
+      ScrollRowsBy(0, -1);
+      return true;
+   }
+   if(key == KEY_RIGHT)
+   {
+      ScrollRowsBy(0, 1);
+      return true;
+   }
+   if(key == KEY_PGUP)
+   {
+      ScrollRowsBy(-MathMax(1, g_rows_visible_rows - 1), 0);
+      return true;
+   }
+   if(key == KEY_PGDN)
+   {
+      ScrollRowsBy(MathMax(1, g_rows_visible_rows - 1), 0);
+      return true;
+   }
+
+   return false;
+}
+
+bool IsLeftButtonDown(const string state_text)
+{
+   int state = (int)StringToInteger(state_text);
+   return ((state & 1) != 0);
+}
+
+bool HandleRowsWindowMouseMove(const long &lparam, const double &dparam, const string &sparam)
+{
+   int px = (int)lparam;
+   int py = (int)dparam;
+   g_last_mouse_x = px;
+   g_last_mouse_y = py;
+
+   if(!g_rows_window_visible)
+      return false;
+
+   bool left_down = IsLeftButtonDown(sparam);
+
+   if(!left_down)
+   {
+      g_rows_drag_kind = ROWS_DRAG_NONE;
+      return false;
+   }
+
+   if(g_rows_drag_kind == ROWS_DRAG_NONE)
+   {
+      if(RowsVThumbHit(px, py))
+      {
+         g_rows_drag_kind = ROWS_DRAG_VSCROLL;
+         g_rows_drag_offset_y = py - g_rows_vthumb_y;
+         return true;
+      }
+      if(RowsHThumbHit(px, py))
+      {
+         g_rows_drag_kind = ROWS_DRAG_HSCROLL;
+         g_rows_drag_offset_x = px - g_rows_hthumb_x;
+         return true;
+      }
+      if(RowsWindowTitleHit(px, py))
+      {
+         g_rows_drag_kind = ROWS_DRAG_WINDOW;
+         g_rows_drag_offset_x = px - g_rows_window_x;
+         g_rows_drag_offset_y = py - g_rows_window_y;
+         return true;
+      }
+
+      return RowsWindowHit(px, py);
+   }
+
+   if(g_rows_drag_kind == ROWS_DRAG_WINDOW)
+   {
+      int new_x = px - g_rows_drag_offset_x;
+      int new_y = py - g_rows_drag_offset_y;
+
+      if(new_x < 0)
+         new_x = 0;
+      if(new_y < 0)
+         new_y = 0;
+
+      if(new_x != g_rows_window_x || new_y != g_rows_window_y)
+      {
+         g_rows_window_x = new_x;
+         g_rows_window_y = new_y;
+         RebuildRowsWindow();
+      }
+      return true;
+   }
+
+   if(g_rows_drag_kind == ROWS_DRAG_VSCROLL)
+   {
+      int max_row = MathMax(0, g_saved_count - g_rows_visible_rows);
+      int new_offset = OffsetFromThumb(py, g_rows_drag_offset_y,
+                                       g_rows_vtrack_y, g_rows_vtrack_h,
+                                       g_rows_vthumb_h, max_row);
+      if(new_offset != g_row_offset)
+      {
+         g_row_offset = new_offset;
+         RebuildRowsWindow();
+      }
+      return true;
+   }
+
+   if(g_rows_drag_kind == ROWS_DRAG_HSCROLL)
+   {
+      int max_col = MathMax(0, 47 - g_rows_visible_cols);
+      int new_offset = OffsetFromThumb(px, g_rows_drag_offset_x,
+                                       g_rows_htrack_x, g_rows_htrack_w,
+                                       g_rows_hthumb_w, max_col);
+      if(new_offset != g_col_offset)
+      {
+         g_col_offset = new_offset;
+         RebuildRowsWindow();
+      }
+      return true;
+   }
+
+   return false;
+}
+
+// Kept as a compatibility wrapper. Rows are now shown in a separate window.
+void CreateRowsTab()
+{
+   OpenRowsWindow();
+}
+
+//----------------------------- Panel rebuild/status ----------------
 void UpdateModeLabel()
 {
    string txt = "Mode: NONE";
@@ -806,6 +1404,24 @@ void UpdateModeLabel()
    SetLabelText("MODE", txt);
    SetLabelText("STATUS", "Saved rows: " + IntegerToString(g_saved_count));
    SetLabelText("ROW_COUNT", "Rows: " + IntegerToString(g_saved_count));
+   SetLabelText("ROWSWIN_COUNT", "Rows: " + IntegerToString(g_saved_count));
+}
+
+void RebuildPanel()
+{
+   SaveFormState();
+   ClearDynamicPanelObjects();
+   CreatePanelBase();
+   CreateFormTab();
+   UpdateModeLabel();
+   ChartRedraw(0);
+}
+
+void CreatePanel()
+{
+   CreatePanelBase();
+   CreateFormTab();
+   UpdateModeLabel();
 }
 
 void SetMode(SelectMode mode)
@@ -1380,7 +1996,7 @@ string BuildEventRow()
    f[k++] = g_screenshot_path;
    f[k++] = IntegerToString(InpEMA20SlopeLookback);
    f[k++] = Dbl(pip, _Digits);
-   f[k++] = "1.2";
+   f[k++] = "1.3";
 
    return JoinCsv(f);
 }
@@ -1399,10 +2015,9 @@ void SaveCurrentEvent()
    g_rows[n] = row;
    g_saved_count = n + 1;
 
-   if(g_tab == TAB_ROWS)
-      RebuildPanel();
-   else
-      UpdateModeLabel();
+   UpdateModeLabel();
+   if(g_rows_window_visible)
+      RebuildRowsWindow();
 
    Alert("Saved Backtesting BO event. Rows in memory: ", g_saved_count);
 }
@@ -1418,7 +2033,7 @@ string CurrentExportName()
    return filename;
 }
 
-void ExportCsv()
+bool ExportCsv()
 {
    string filename = CurrentExportName();
 
@@ -1430,38 +2045,159 @@ void ExportCsv()
    if(handle == INVALID_HANDLE)
    {
       Alert("Could not open export file: ", filename, " error: ", GetLastError());
-      return;
+      return false;
    }
 
-FileWriteString(handle, HeaderRow() + "\r\n");
+   FileWriteString(handle, HeaderRow() + "\r\n");
 
-for(int i = 0; i < ArraySize(g_rows); i++)
-   FileWriteString(handle, g_rows[i] + "\r\n");
+   for(int i = 0; i < ArraySize(g_rows); i++)
+      FileWriteString(handle, g_rows[i] + "\r\n");
 
-FileClose(handle);
+   FileClose(handle);
 
    Alert("Exported ", ArraySize(g_rows), " rows to MQL5/Files/", filename);
+   return true;
+}
+
+bool IsDigitsOnly(const string text)
+{
+   if(StringLen(text) <= 0)
+      return false;
+
+   for(int i = 0; i < StringLen(text); i++)
+   {
+      ushort ch = StringGetCharacter(text, i);
+      if(ch < '0' || ch > '9')
+         return false;
+   }
+
+   return true;
+}
+
+string WithoutCsvExtension(const string filename)
+{
+   int len = StringLen(filename);
+   if(len >= 4 && StringSubstr(filename, len - 4) == ".csv")
+      return StringSubstr(filename, 0, len - 4);
+
+   return filename;
+}
+
+string NextExportName()
+{
+   string current = CurrentExportName();
+   string base = WithoutCsvExtension(current);
+
+   int last_underscore = -1;
+   for(int i = StringLen(base) - 1; i >= 0; i--)
+   {
+      if(StringGetCharacter(base, i) == '_')
+      {
+         last_underscore = i;
+         break;
+      }
+   }
+
+   int start_number = 1;
+   if(last_underscore > 0 && last_underscore < StringLen(base) - 1)
+   {
+      string suffix = StringSubstr(base, last_underscore + 1);
+      if(IsDigitsOnly(suffix))
+      {
+         start_number = (int)StringToInteger(suffix) + 1;
+         base = StringSubstr(base, 0, last_underscore);
+      }
+   }
+
+   int common_flag = InpUseCommonFiles ? FILE_COMMON : 0;
+   for(int n = start_number; n < start_number + 10000; n++)
+   {
+      string candidate = base + "_" + IntegerToString(n) + ".csv";
+      if(candidate != current && !FileIsExist(candidate, common_flag))
+         return candidate;
+   }
+
+   MqlDateTime dt;
+   TimeToStruct(TimeLocal(), dt);
+   return base + "_" + StringFormat("%04d%02d%02d_%02d%02d%02d", dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec) + ".csv";
+}
+
+void ResetFormStateForNewFile(const string new_export_name)
+{
+   g_export_name = new_export_name;
+   g_break_out_of_what = "";
+   g_pattern = "";
+   g_from_pullback = "";
+   g_at_leg = "";
+   g_htf_location = "";
+   g_market_condition = "";
+   g_market_direction = "";
+   g_ft_before_pb = "";
+   g_screenshot_path = "";
+   g_note = "";
+
+   if(ObjectFind(0, Obj("FORM_EDIT_EXPORT_NAME")) >= 0)
+      ObjectSetString(0, Obj("FORM_EDIT_EXPORT_NAME"), OBJPROP_TEXT, g_export_name);
+   if(ObjectFind(0, Obj("FORM_EDIT_BREAK_OUT_OF_WHAT")) >= 0)
+      ObjectSetString(0, Obj("FORM_EDIT_BREAK_OUT_OF_WHAT"), OBJPROP_TEXT, g_break_out_of_what);
+   if(ObjectFind(0, Obj("FORM_EDIT_PATTERN")) >= 0)
+      ObjectSetString(0, Obj("FORM_EDIT_PATTERN"), OBJPROP_TEXT, g_pattern);
+   if(ObjectFind(0, Obj("FORM_EDIT_FROM_PULLBACK")) >= 0)
+      ObjectSetString(0, Obj("FORM_EDIT_FROM_PULLBACK"), OBJPROP_TEXT, g_from_pullback);
+   if(ObjectFind(0, Obj("FORM_EDIT_AT_LEG")) >= 0)
+      ObjectSetString(0, Obj("FORM_EDIT_AT_LEG"), OBJPROP_TEXT, g_at_leg);
+   if(ObjectFind(0, Obj("FORM_EDIT_HTF_LOCATION")) >= 0)
+      ObjectSetString(0, Obj("FORM_EDIT_HTF_LOCATION"), OBJPROP_TEXT, g_htf_location);
+   if(ObjectFind(0, Obj("FORM_EDIT_MARKET_CONDITION")) >= 0)
+      ObjectSetString(0, Obj("FORM_EDIT_MARKET_CONDITION"), OBJPROP_TEXT, g_market_condition);
+   if(ObjectFind(0, Obj("FORM_EDIT_MARKET_DIRECTION")) >= 0)
+      ObjectSetString(0, Obj("FORM_EDIT_MARKET_DIRECTION"), OBJPROP_TEXT, g_market_direction);
+   if(ObjectFind(0, Obj("FORM_EDIT_FT_BEFORE_PB")) >= 0)
+      ObjectSetString(0, Obj("FORM_EDIT_FT_BEFORE_PB"), OBJPROP_TEXT, g_ft_before_pb);
+   if(ObjectFind(0, Obj("FORM_EDIT_SCREENSHOT")) >= 0)
+      ObjectSetString(0, Obj("FORM_EDIT_SCREENSHOT"), OBJPROP_TEXT, g_screenshot_path);
+   if(ObjectFind(0, Obj("FORM_EDIT_NOTE")) >= 0)
+      ObjectSetString(0, Obj("FORM_EDIT_NOTE"), OBJPROP_TEXT, g_note);
 }
 
 void NewFile()
 {
+   string next_filename = NextExportName();
+
    if(g_saved_count > 0)
    {
-      int ans = MessageBox("Start a new file? Current saved rows in memory will be cleared. Export first if needed.",
-                           "Backtesting BO", MB_YESNO | MB_ICONQUESTION);
-      if(ans != IDYES)
+      int ans = MessageBox(
+         "Export the current rows before starting a new empty file?\n\n"
+         "Yes = export current rows, then start a new file.\n"
+         "No = start a new file without exporting.\n"
+         "Cancel = keep the current file.",
+         "Backtesting BO",
+         MB_YESNOCANCEL | MB_ICONQUESTION
+      );
+   
+      if(ans == IDCANCEL)
          return;
+   
+      if(ans == IDYES)
+      {
+         if(!ExportCsv())
+            return;
+      }
    }
 
    ArrayResize(g_rows, 0);
    g_saved_count = 0;
    g_row_offset = 0;
    g_col_offset = 0;
+
    ClearSelections();
-   if(g_tab == TAB_ROWS)
-      RebuildPanel();
-   else
-      UpdateModeLabel();
+   ResetFormStateForNewFile(next_filename);
+   RebuildPanel();
+
+   if(g_rows_window_visible)
+      RebuildRowsWindow();
+
+   Alert("Started a new empty CSV file: ", g_export_name);
 }
 
 void CloseIndicatorFromButton()
@@ -1473,55 +2209,48 @@ void CloseIndicatorFromButton()
 void HandleObjectClick(const string obj_name)
 {
    g_ignore_next_chart_click = true;
+   ResetButtonState(obj_name);
+   SetChartMouseScrollState(false);
 
    if(obj_name == Obj("BTN_CLOSE"))
       CloseIndicatorFromButton();
+
    else if(obj_name == Obj("BTN_TAB_FORM"))
    {
       g_tab = TAB_FORM;
       RebuildPanel();
    }
+
    else if(obj_name == Obj("BTN_TAB_ROWS"))
-   {
-      g_tab = TAB_ROWS;
-      RebuildPanel();
-   }
+      OpenRowsWindow();
+
+   else if(obj_name == Obj("ROWSWIN_BTN_CLOSE"))
+      CloseRowsWindow();
+
    else if(obj_name == Obj("FORM_BTN_BO"))
       SetMode(MODE_BO);
+
    else if(obj_name == Obj("FORM_BTN_FT"))
       SetMode(MODE_FT);
+
    else if(obj_name == Obj("FORM_BTN_POINT"))
       SetMode(MODE_BO_POINT);
+
    else if(obj_name == Obj("FORM_BTN_LEG"))
       SetMode(MODE_LEG);
+
    else if(obj_name == Obj("FORM_BTN_SWING"))
       SetMode(MODE_SWING);
+
    else if(obj_name == Obj("FORM_BTN_SAVE"))
       SaveCurrentEvent();
-   else if(obj_name == Obj("FORM_BTN_EXPORT") || obj_name == Obj("ROW_BTN_EXPORT"))
+
+   else if(obj_name == Obj("FORM_BTN_EXPORT") || obj_name == Obj("ROWSWIN_BTN_EXPORT"))
       ExportCsv();
-   else if(obj_name == Obj("FORM_BTN_NEW") || obj_name == Obj("ROW_BTN_NEW"))
+
+   else if(obj_name == Obj("FORM_BTN_NEW") || obj_name == Obj("ROWSWIN_BTN_NEW"))
       NewFile();
-   else if(obj_name == Obj("ROW_BTN_UP"))
-   {
-      g_row_offset--;
-      RebuildPanel();
-   }
-   else if(obj_name == Obj("ROW_BTN_DN"))
-   {
-      g_row_offset++;
-      RebuildPanel();
-   }
-   else if(obj_name == Obj("ROW_BTN_LEFT"))
-   {
-      g_col_offset--;
-      RebuildPanel();
-   }
-   else if(obj_name == Obj("ROW_BTN_RIGHT"))
-   {
-      g_col_offset++;
-      RebuildPanel();
-   }
+
    else if(obj_name == Obj("FORM_BTN_CLEAR"))
       ClearSelections();
 }
@@ -1559,19 +2288,44 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       return;
    }
 
+   if(id == CHARTEVENT_MOUSE_MOVE)
+   {
+      bool left_down = IsLeftButtonDown(sparam);
+      UpdateChartMouseScrollProtection((int)lparam, (int)dparam, left_down);
+
+      if(HandleRowsWindowMouseMove(lparam, dparam, sparam))
+         return;
+   }
+
+   if(id == CHARTEVENT_MOUSE_WHEEL)
+   {
+      if(HandleRowsWindowWheel(lparam, dparam, sparam))
+         return;
+   }
+
    if(id == CHARTEVENT_KEYDOWN)
    {
+      if(HandleRowsWindowKey((int)lparam))
+         return;
+
       HandleKey((int)lparam);
       return;
    }
 
    if(id == CHARTEVENT_CLICK)
    {
+      g_last_mouse_x = (int)lparam;
+      g_last_mouse_y = (int)dparam;
+      UpdateChartMouseScrollProtection(g_last_mouse_x, g_last_mouse_y, false);
+
       if(g_ignore_next_chart_click)
       {
          g_ignore_next_chart_click = false;
          return;
       }
+
+      if(HandleRowsWindowClick(lparam, dparam))
+         return;
 
       if(ClickInsidePanel(lparam, dparam))
          return;
@@ -1603,6 +2357,10 @@ int OnInit()
 {
    PREFIX = "BTBO_" + _Symbol + "_" + IntegerToString((int)_Period) + "_";
    g_export_name = InpDefaultExportName;
+   g_rows_window_x = InpRowsWindowX;
+   g_rows_window_y = InpRowsWindowY;
+   g_chart_mouse_scroll_initial = (bool)ChartGetInteger(0, CHART_MOUSE_SCROLL);
+   g_chart_mouse_scroll_current = g_chart_mouse_scroll_initial;
 
    SetIndexBuffer(0, SelOpenBuffer,  INDICATOR_DATA);
    SetIndexBuffer(1, SelHighBuffer,  INDICATOR_DATA);
@@ -1629,6 +2387,7 @@ int OnInit()
 
    IndicatorSetString(INDICATOR_SHORTNAME, "Backtesting BO");
    ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
+   ChartSetInteger(0, CHART_EVENT_MOUSE_WHEEL, true);
 
    CreatePanel();
    UpdateModeLabel();
@@ -1645,6 +2404,7 @@ void OnDeinit(const int reason)
    if(ema60_handle != INVALID_HANDLE)
       IndicatorRelease(ema60_handle);
 
+   ChartSetInteger(0, CHART_MOUSE_SCROLL, g_chart_mouse_scroll_initial);
    DeleteObjects();
    ChartRedraw(0);
 }
