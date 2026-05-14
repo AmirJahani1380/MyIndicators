@@ -172,6 +172,65 @@ bool ExistsBreakBefore_NS(const bool breakAbove,
    return false;
 }
 
+int FindFirstBOSBreak_NS(const bool breakAbove,
+                         const double &h[], const double &l[],
+                         const double level,
+                         const int ns_from, const int ns_to,
+                         const int rates_total, const bool seriesArrays)
+{
+   if(ns_to < ns_from) return -1;
+
+   const double eps = _Point * 0.5;
+
+   for(int ns = ns_from; ns <= ns_to; ++ns)
+   {
+      int ai = MapNS2Arr(ns, rates_total, seriesArrays);
+      if(breakAbove)
+      {
+         if(h[ai] > level + eps) return ns;   // first BOS candle (NS index)
+      }
+      else
+      {
+         if(l[ai] < level - eps) return ns;   // first BOS candle (NS index)
+      }
+   }
+   return -1;
+}
+
+// Option A: "broken" means FULL candle break (same as TL break logic)
+// Demand TL (lows): broken if a candle is FULLY BELOW line  => FullOHLC_BelowLine (uses high[])
+// Supply TL (highs): broken if a candle is FULLY ABOVE line => FullOHLC_AboveLine (uses low[])
+bool TrendlineBrokenBeforeBOS(const bool isHighTL,
+                              const datetime &time[],
+                              const double &high[],
+                              const double &low[],
+                              const int rates_total, const bool seriesArrays,
+                              const int ns1, const double p1, const int ns2, const double p2,
+                              const int ns_from, const int ns_to_inclusive)
+{
+   if(ns_to_inclusive < ns_from) return false;
+
+   for(int ns = ns_from; ns <= ns_to_inclusive; ++ns)
+   {
+      int ai = MapNS2Arr(ns, rates_total, seriesArrays);
+
+      if(!isHighTL)
+      {
+         // Demand TL broken DOWN
+         if(FullOHLC_BelowLine(time, high, ai, ns1, p1, ns2, p2))
+            return true;
+      }
+      else
+      {
+         // Supply TL broken UP
+         if(FullOHLC_AboveLine(time, low, ai, ns1, p1, ns2, p2))
+            return true;
+      }
+   }
+   return false;
+}
+
+
 void ComputeTrendlineAt(AZState &st,
                         const datetime &t[],
                         const double &h[],
@@ -192,115 +251,158 @@ void ComputeTrendlineAt(AZState &st,
    out.idx_old_arr = -1;
    out.idx_new_arr = -1;
 
-   int p = MathMax(1, SwingPeriod);
+   const int p = MathMax(1, SwingPeriod);
    if(rates_total < (2*p + 1)) return;
 
-   int i_end   = ns_end - p;
-   int i_start = MathMax(p, ns_end - CandleWindow - p);
+   const int i_end   = ns_end - p;
+   const int i_start = MathMax(p, ns_end - CandleWindow - p);
    if(i_end < i_start) return;
 
-   int newest=-1, second=-1;
-   double px_new=0.0, px_old=0.0;
+   // Collect up to last 10 swings (newest first)
+   #define MAX_SW 10
+   int      sw_ns[MAX_SW];
+   int      sw_ai[MAX_SW];
+   double   sw_px[MAX_SW];
+   datetime sw_t[MAX_SW];
+   int      sw_cnt = 0;
 
-   for(int i = i_end; i >= i_start; --i)
+   for(int ns = i_end; ns >= i_start && sw_cnt < MAX_SW; --ns)
    {
-      bool ok = isHigh ? IsSwingHigh_NS(h, i, p, rates_total, seriesArrays)
-                       : IsSwingLow_NS (l, i, p, rates_total, seriesArrays);
+      bool ok = isHigh ? IsSwingHigh_NS(h, ns, p, rates_total, seriesArrays)
+                       : IsSwingLow_NS (l, ns, p, rates_total, seriesArrays);
 
-      if(ok)
-      {
-         int ai = MapNS2Arr(i, rates_total, seriesArrays);
-         double price = isHigh ? h[ai] : l[ai];
-         ConsiderPoint(i, price, newest, px_new, second, px_old);
-         if(newest >= 0 && second >= 0) break;
-      }
+      if(!ok) continue;
+
+      int ai = MapNS2Arr(ns, rates_total, seriesArrays);
+      double price = isHigh ? h[ai] : l[ai];
+
+      sw_ns[sw_cnt] = ns;
+      sw_ai[sw_cnt] = ai;
+      sw_px[sw_cnt] = price;
+      sw_t[sw_cnt]  = t[ai];
+      sw_cnt++;
    }
 
-   if(newest < 0 || second < 0) return;
+   if(sw_cnt < 2) return;
 
-   int older_idx = second;
-   int newer_idx = newest;
-   double older_px = px_old;
-   double newer_px = px_new;
+   // Always use latest swing as endpoint
+   const int      newer_idx = sw_ns[0];
+   const int      anew      = sw_ai[0];
+   const double   newer_px  = sw_px[0];
+   const datetime newer_t   = sw_t[0];
 
-   if(older_idx > newer_idx)
+   // Try closest older swings first (latest possible match)
+   for(int k = 1; k < sw_cnt; ++k)
    {
-      int ti = older_idx; older_idx = newer_idx; newer_idx = ti;
-      double tp = older_px; older_px = newer_px; newer_px = tp;
-   }
+      const int      older_idx = sw_ns[k];
+      const int      aold      = sw_ai[k];
+      const double   older_px  = sw_px[k];
+      const datetime older_t   = sw_t[k];
 
+      // Ensure ordering older -> newer in NS space
+      if(older_idx >= newer_idx) continue;
 
-   // only draw when swing distance >= SwingPeriod (in candles)
-   if((newer_idx - older_idx) < SwingPeriod) return;
-   // enforce correct slope direction
-   if(!isHigh)
-   {
-      if(!(newer_px > older_px)) return;
-   }
-   else
-   {
-      if(!(newer_px < older_px)) return;
-   }
+      // Must be >= SwingPeriod candles apart
+      if((newer_idx - older_idx) < SwingPeriod) continue;
 
-   // validation filter
-   int aold_chk = MapNS2Arr(older_idx, rates_total, seriesArrays);
-   int anew_chk = MapNS2Arr(newer_idx, rates_total, seriesArrays);
-
-   if(!InpUseBOSValidation)
-   {
+      // Slope direction rule
       if(!isHigh)
       {
-         if(!(h[anew_chk] > h[aold_chk])) return;
+         // Demand TL: higher low
+         if(!(newer_px > older_px)) continue;
       }
       else
       {
-         if(!(l[anew_chk] < l[aold_chk])) return;
+         // Supply TL: lower high
+         if(!(newer_px < older_px)) continue;
       }
-   }
-   else
-   {
-      if(!isHigh)
+
+      // Additional validation
+      if(!InpUseBOSValidation)
       {
-         double H12 = MaxHighBetweenNS(h, older_idx, newer_idx, rates_total, seriesArrays);
-         int nextL = FindNextSwingAfter_NS(false, h, l, newer_idx+1, i_end, p, rates_total, seriesArrays);
-         int limit = (nextL >= 0 ? (nextL - 1) : i_end);
-         if(!ExistsBreakBefore_NS(true, h, l, H12, newer_idx+1, limit, rates_total, seriesArrays))
-            return;
+         // Same as your old "non-BOS" filter
+         if(!isHigh)
+         {
+            if(!(h[anew] > h[aold])) continue;
+         }
+         else
+         {
+            if(!(l[anew] < l[aold])) continue;
+         }
       }
       else
       {
-         double L12 = MinLowBetweenNS(l, older_idx, newer_idx, rates_total, seriesArrays);
-         int nextH = FindNextSwingAfter_NS(true, h, l, newer_idx+1, i_end, p, rates_total, seriesArrays);
-         int limit = (nextH >= 0 ? (nextH - 1) : i_end);
-         if(!ExistsBreakBefore_NS(false, h, l, L12, newer_idx+1, limit, rates_total, seriesArrays))
-            return;
+         // BOS must happen BEFORE the next swing of same type after the newer swing
+         if(!isHigh)
+         {
+            const double H12 = MaxHighBetweenNS(h, older_idx, newer_idx, rates_total, seriesArrays);
+
+            const int nextL = FindNextSwingAfter_NS(false, h, l, newer_idx+1, i_end, p, rates_total, seriesArrays);
+            const int limit = (nextL >= 0 ? (nextL - 1) : i_end);
+
+            // Find first BOS candle (high breaks above H12)
+            const int bos_ns = FindFirstBOSBreak_NS(true, h, l, H12, newer_idx+1, limit, rates_total, seriesArrays);
+            if(bos_ns < 0) continue;
+
+            // Reject if TL would have been broken BEFORE BOS happens (Option A: full candle break)
+            // "Before BOS" => scan newer+1 .. bos-1
+            if(TrendlineBrokenBeforeBOS(false, t, h, l, rates_total, seriesArrays,
+                                       older_idx, older_px, newer_idx, newer_px,
+                                       newer_idx+1, bos_ns-1))
+               continue;
+         }
+         else
+         {
+            const double L12 = MinLowBetweenNS(l, older_idx, newer_idx, rates_total, seriesArrays);
+
+            const int nextH = FindNextSwingAfter_NS(true, h, l, newer_idx+1, i_end, p, rates_total, seriesArrays);
+            const int limit = (nextH >= 0 ? (nextH - 1) : i_end);
+
+            // Find first BOS candle (low breaks below L12)
+            const int bos_ns = FindFirstBOSBreak_NS(false, h, l, L12, newer_idx+1, limit, rates_total, seriesArrays);
+            if(bos_ns < 0) continue;
+
+            // Reject if TL would have been broken BEFORE BOS happens (Option A: full candle break)
+            if(TrendlineBrokenBeforeBOS(true, t, h, l, rates_total, seriesArrays,
+                                       older_idx, older_px, newer_idx, newer_px,
+                                       newer_idx+1, bos_ns-1))
+               continue;
+         }
       }
+
+      // Angle filter (unchanged logic)
+      if(AngleBased)
+      {
+         double atr_val = 0.0;
+         if(!GetATRAtArrIndex(st, anew, atr_val)) continue;
+
+         const int bars = (newer_idx - older_idx);
+         if(!AnglePass_ByATR(older_px, newer_px, bars, atr_val)) continue;
+      }
+
+      // Guard (object endpoints must be distinct in time)
+      if(older_t == newer_t) continue;
+
+      // If we reached here => this is the latest valid match. Set output and stop.
+      out.has = true;
+
+      out.t1 = older_t; out.p1 = older_px;
+      out.t2 = newer_t; out.p2 = newer_px;
+
+      out.ns1 = older_idx;
+      out.ns2 = newer_idx;
+
+      out.swing_ns = newer_idx;
+      out.swingTime = newer_t;
+
+      out.idx_old_arr = aold;
+      out.idx_new_arr = anew;
+
+      return;
    }
 
-   if(AngleBased)
-   {
-      int anew = MapNS2Arr(newer_idx, rates_total, seriesArrays);
-      double atr_val = 0.0;
-      if(!GetATRAtArrIndex(st, anew, atr_val)) return;
-      int bars = newer_idx - older_idx;
-      if(!AnglePass_ByATR(older_px, newer_px, bars, atr_val)) return;
-   }
-
-   int aold = MapNS2Arr(older_idx, rates_total, seriesArrays);
-   int anew = MapNS2Arr(newer_idx, rates_total, seriesArrays);
-
-   // guard against degenerate anchors
-   if(t[aold] == t[anew]) return;
-
-   out.has = true;
-   out.t1 = t[aold]; out.p1 = older_px;
-   out.t2 = t[anew]; out.p2 = newer_px;
-   out.ns1 = older_idx;
-   out.ns2 = newer_idx;
-   out.swing_ns = newer_idx;
-   out.swingTime = t[anew];
-   out.idx_old_arr = aold;
-   out.idx_new_arr = anew;
+   // No valid match => no trendline
+   out.has = false;
 }
 
 void DrawTrendlineObject(const string name,
@@ -367,12 +469,12 @@ datetime CandleCloseTime(const datetime &timeOpen)
 
 // “full OHLC” reduces to single extreme test
 bool FullOHLC_AboveLine(const datetime &time[], const double &low[],
-                        const int i, const int ns1,double p1, const int ns2,double p2)
+                        const int i, const int ns1, const double p1, const int ns2, const double p2)
 {
    const int rates_total = ArraySize(time);
    const bool seriesArrays = (rates_total > 1 && time[0] > time[rates_total-1]);
 
-   // evaluate line at candle close => +1 candle step in NS space
+   // Evaluate line at candle close => +1 candle step in NS space
    const int nsClose = MapArr2NS(i, rates_total, seriesArrays) + 1;
 
    const double lp = LinePriceAt(nsClose, ns1, p1, ns2, p2);
@@ -381,12 +483,12 @@ bool FullOHLC_AboveLine(const datetime &time[], const double &low[],
 }
 
 bool FullOHLC_BelowLine(const datetime &time[], const double &high[],
-                        const int i, const int ns1,double p1, const int ns2,double p2)
+                        const int i, const int ns1, const double p1, const int ns2, const double p2)
 {
    const int rates_total = ArraySize(time);
    const bool seriesArrays = (rates_total > 1 && time[0] > time[rates_total-1]);
 
-   // evaluate line at candle close => +1 candle step in NS space
+   // Evaluate line at candle close => +1 candle step in NS space
    const int nsClose = MapArr2NS(i, rates_total, seriesArrays) + 1;
 
    const double lp = LinePriceAt(nsClose, ns1, p1, ns2, p2);
