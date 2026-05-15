@@ -2018,8 +2018,6 @@ void SaveCurrentEvent()
    UpdateModeLabel();
    if(g_rows_window_visible)
       RebuildRowsWindow();
-
-   Alert("Saved Backtesting BO event. Rows in memory: ", g_saved_count);
 }
 
 string CurrentExportName()
@@ -2162,27 +2160,16 @@ void ResetFormStateForNewFile(const string new_export_name)
 
 void NewFile()
 {
+   string current_filename = CurrentExportName();
    string next_filename = NextExportName();
+   bool exported_old_file = false;
 
    if(g_saved_count > 0)
    {
-      int ans = MessageBox(
-         "Export the current rows before starting a new empty file?\n\n"
-         "Yes = export current rows, then start a new file.\n"
-         "No = start a new file without exporting.\n"
-         "Cancel = keep the current file.",
-         "Backtesting BO",
-         MB_YESNOCANCEL | MB_ICONQUESTION
-      );
-   
-      if(ans == IDCANCEL)
+      if(!ExportCsv())
          return;
-   
-      if(ans == IDYES)
-      {
-         if(!ExportCsv())
-            return;
-      }
+
+      exported_old_file = true;
    }
 
    ArrayResize(g_rows, 0);
@@ -2197,7 +2184,10 @@ void NewFile()
    if(g_rows_window_visible)
       RebuildRowsWindow();
 
-   Alert("Started a new empty CSV file: ", g_export_name);
+   if(exported_old_file)
+      Alert("Exported ", current_filename, " and started a new empty CSV file: ", g_export_name);
+   else
+      Alert("Started a new empty CSV file: ", g_export_name);
 }
 
 void CloseIndicatorFromButton()
