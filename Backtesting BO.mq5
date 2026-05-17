@@ -509,8 +509,57 @@ double CandleRangeInATR(int shift)
 }
 
 //----------------------------- Visual markers ----------------------
+void PaintSelectedCandleBuffer(const int shift, const int color_index)
+{
+   int rates_total = Bars(_Symbol, _Period);
+   if(rates_total <= 0 || shift < 0)
+      return;
+
+   int idx = rates_total - 1 - shift;
+
+   if(idx < 0 || idx >= rates_total)
+      return;
+
+   if(idx >= ArraySize(SelOpenBuffer) ||
+      idx >= ArraySize(SelHighBuffer) ||
+      idx >= ArraySize(SelLowBuffer) ||
+      idx >= ArraySize(SelCloseBuffer) ||
+      idx >= ArraySize(SelColorBuffer))
+      return;
+
+   SelOpenBuffer[idx]  = iOpen(_Symbol, _Period, shift);
+   SelHighBuffer[idx]  = iHigh(_Symbol, _Period, shift);
+   SelLowBuffer[idx]   = iLow(_Symbol, _Period, shift);
+   SelCloseBuffer[idx] = iClose(_Symbol, _Period, shift);
+   SelColorBuffer[idx] = color_index;
+}
+
 void RefreshSelectedCandles()
 {
+   int rates_total = Bars(_Symbol, _Period);
+
+   int n = ArraySize(SelOpenBuffer);
+   if(ArraySize(SelHighBuffer) < n)   n = ArraySize(SelHighBuffer);
+   if(ArraySize(SelLowBuffer) < n)    n = ArraySize(SelLowBuffer);
+   if(ArraySize(SelCloseBuffer) < n)  n = ArraySize(SelCloseBuffer);
+   if(ArraySize(SelColorBuffer) < n)  n = ArraySize(SelColorBuffer);
+   if(rates_total < n)                n = rates_total;
+
+   for(int i = 0; i < n; i++)
+   {
+      SelOpenBuffer[i]  = EMPTY_VALUE;
+      SelHighBuffer[i]  = EMPTY_VALUE;
+      SelLowBuffer[i]   = EMPTY_VALUE;
+      SelCloseBuffer[i] = EMPTY_VALUE;
+      SelColorBuffer[i] = 0;
+   }
+
+   if(g_has_bo)
+      PaintSelectedCandleBuffer(g_bo_index, 1);
+
+   if(g_has_ft)
+      PaintSelectedCandleBuffer(g_ft_index, 2);
+
    ChartRedraw(0);
 }
 
@@ -2343,6 +2392,12 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
 }
 
 //----------------------------- MT5 lifecycle -----------------------
+void OnTimer()
+{
+   if(InpShowPanel || g_rows_window_visible)
+      ChartRedraw(0);
+}
+
 int OnInit()
 {
    PREFIX = "BTBO_" + _Symbol + "_" + IntegerToString((int)_Period) + "_";
@@ -2378,15 +2433,20 @@ int OnInit()
    IndicatorSetString(INDICATOR_SHORTNAME, "Backtesting BO");
    ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
    ChartSetInteger(0, CHART_EVENT_MOUSE_WHEEL, true);
-
+   
+   EventSetTimer(1);
+   
    CreatePanel();
    UpdateModeLabel();
-
+   ChartRedraw(0);
+   
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
+   EventKillTimer();
+   
    if(atr_handle != INVALID_HANDLE)
       IndicatorRelease(atr_handle);
    if(ema20_handle != INVALID_HANDLE)
