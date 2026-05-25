@@ -404,6 +404,36 @@ bool GetBufferValue(int handle, int shift, double &value)
    return true;
 }
 
+// Convert a stable candle open time back to the current MT5 shift.
+// This prevents selected candles from moving when a new live candle appears.
+int ShiftFromTime(datetime candle_time)
+{
+   if(candle_time <= 0)
+      return -1;
+
+   return iBarShift(_Symbol, _Period, candle_time, true);
+}
+
+// The stored times are the source of truth. Indexes are only a cache.
+void SyncSelectionIndexesFromTimes()
+{
+   if(g_has_bo)
+      g_bo_index = ShiftFromTime(g_bo_time);
+
+   if(g_has_ft)
+      g_ft_index = ShiftFromTime(g_ft_time);
+
+   if(g_has_leg)
+   {
+      g_leg_start_index = ShiftFromTime(g_leg_start_time);
+      g_leg_end_index   = ShiftFromTime(g_leg_end_time);
+      g_pb_end_index    = ShiftFromTime(g_pb_end_time);
+   }
+
+   if(g_has_swing)
+      g_swing_index = ShiftFromTime(g_swing_time);
+}
+
 bool PointInRect(const int px, const int py, const int x, const int y, const int w, const int h)
 {
    return (px >= x && px <= x + w && py >= y && py <= y + h);
@@ -537,6 +567,7 @@ void PaintSelectedCandleBuffer(const int shift, const int color_index)
 void RefreshSelectedCandles()
 {
    int rates_total = Bars(_Symbol, _Period);
+   SyncSelectionIndexesFromTimes();
 
    int n = ArraySize(SelOpenBuffer);
    if(ArraySize(SelHighBuffer) < n)   n = ArraySize(SelHighBuffer);
@@ -1901,6 +1932,10 @@ string HeaderRow()
 string BuildEventRow()
 {
    SaveFormState();
+   SyncSelectionIndexesFromTimes();
+
+   if(g_has_swing && g_swing_index >= 0)
+      g_swing_period = CalculateSwingPeriod(g_swing_index);
 
    string f[];
    ArrayResize(f, 47);
@@ -2481,8 +2516,11 @@ int OnCalculate(const int rates_total,
 
    if(g_has_bo)
    {
-      int idx = rates_total - 1 - g_bo_index;
-      if(idx >= 0 && idx < rates_total)
+      int bo_shift = ShiftFromTime(g_bo_time);
+      g_bo_index = bo_shift;
+
+      int idx = rates_total - 1 - bo_shift;
+      if(bo_shift >= 0 && idx >= 0 && idx < rates_total)
       {
          SelOpenBuffer[idx]  = open[idx];
          SelHighBuffer[idx]  = high[idx];
@@ -2494,8 +2532,11 @@ int OnCalculate(const int rates_total,
 
    if(g_has_ft)
    {
-      int idx = rates_total - 1 - g_ft_index;
-      if(idx >= 0 && idx < rates_total)
+      int ft_shift = ShiftFromTime(g_ft_time);
+      g_ft_index = ft_shift;
+
+      int idx = rates_total - 1 - ft_shift;
+      if(ft_shift >= 0 && idx >= 0 && idx < rates_total)
       {
          SelOpenBuffer[idx]  = open[idx];
          SelHighBuffer[idx]  = high[idx];
