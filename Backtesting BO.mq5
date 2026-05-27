@@ -208,6 +208,14 @@ int      g_swing_period = -1;
 string   g_rows[];
 int      g_saved_count = 0;
 
+int      g_edit_row_index = -1;
+bool     g_undo_available = false;
+string   g_undo_rows[];
+int      g_undo_saved_count = 0;
+int      g_undo_row_offset = 0;
+int      g_undo_col_offset = 0;
+
+
 // Form state is stored here so switching/rebuilding UI does not erase input text.
 string g_export_name;
 string g_break_out_of_what = "";
@@ -1184,7 +1192,7 @@ void CreateFormTab()
    MakeButton("FORM_BTN_SWING",    x + 306, by, 82, 20, "S: Swing");
 
    by += 26;
-   MakeButton("FORM_BTN_SAVE",     x + 10,  by, 98, 22, "Save Event");
+   MakeButton("FORM_BTN_SAVE",     x + 10,  by, 98, 22, (g_edit_row_index >= 0 ? "Update Row" : "Save Event"));
    MakeButton("FORM_BTN_EXPORT",   x + 112, by, 98, 22, "Export CSV");
    MakeButton("FORM_BTN_NEW",      x + 214, by, 88, 22, "New File");
    MakeButton("FORM_BTN_CLEAR",    x + 306, by, 88, 22, "Clear Sel.");
@@ -1278,6 +1286,157 @@ string FieldAtCsvIndex(const string row, int wanted)
    if(idx == wanted)
       return cur;
    return out;
+}
+
+
+//----------------------------- Row edit/delete/undo ----------------
+void SnapshotRowsForUndo()
+{
+   ArrayResize(g_undo_rows, g_saved_count);
+   for(int i = 0; i < g_saved_count; i++)
+      g_undo_rows[i] = g_rows[i];
+
+   g_undo_saved_count = g_saved_count;
+   g_undo_row_offset = g_row_offset;
+   g_undo_col_offset = g_col_offset;
+   g_undo_available = true;
+}
+
+void UndoRowsChange()
+{
+   if(!g_undo_available)
+   {
+      Alert("Nothing to undo.");
+      return;
+   }
+
+   ArrayResize(g_rows, g_undo_saved_count);
+   for(int i = 0; i < g_undo_saved_count; i++)
+      g_rows[i] = g_undo_rows[i];
+
+   g_saved_count = g_undo_saved_count;
+   g_row_offset = g_undo_row_offset;
+   g_col_offset = g_undo_col_offset;
+   g_edit_row_index = -1;
+   g_undo_available = false;
+
+   UpdateModeLabel();
+   RebuildPanel();
+   RebuildRowsWindow();
+   Alert("Undo completed.");
+}
+
+void CsvRowToFields(const string row, string &fields[])
+{
+   ArrayResize(fields, 47);
+   for(int i = 0; i < 47; i++)
+      fields[i] = FieldAtCsvIndex(row, i);
+}
+
+string BuildEditedRowFromOriginal(const string original_row)
+{
+   SaveFormState();
+
+   string f[];
+   CsvRowToFields(original_row, f);
+
+   f[16] = "";                         // removed: FT before first PB
+   f[21] = BreakoutOfWhatForCsv();
+   f[22] = g_pattern;
+   f[23] = "";                         // removed: BO from pullback
+   f[24] = g_at_leg;
+   f[26] = g_htf_location;
+   f[27] = g_market_condition;
+   f[28] = g_market_direction;
+   f[42] = g_note;
+   f[43] = g_screenshot_path;
+
+   return JoinCsv(f);
+}
+
+void LoadEditableFieldsFromRow(const int row_index)
+{
+   if(row_index < 0 || row_index >= g_saved_count)
+      return;
+
+   string row = g_rows[row_index];
+
+   g_break_out_of_what = FieldAtCsvIndex(row, 21);
+   g_pattern = FieldAtCsvIndex(row, 22);
+   g_from_pullback = "";
+   g_at_leg = FieldAtCsvIndex(row, 24);
+   g_htf_location = FieldAtCsvIndex(row, 26);
+   g_market_condition = FieldAtCsvIndex(row, 27);
+   g_market_direction = FieldAtCsvIndex(row, 28);
+   g_ft_before_pb = "";
+   g_note = FieldAtCsvIndex(row, 42);
+   g_screenshot_path = FieldAtCsvIndex(row, 43);
+}
+
+void StartEditSavedRow(const int row_index)
+{
+   if(row_index < 0 || row_index >= g_saved_count)
+      return;
+
+   SaveFormState();
+   LoadEditableFieldsFromRow(row_index);
+   g_edit_row_index = row_index;
+   ClosePickerWindow();
+   RebuildPanel();
+   RebuildRowsWindow();
+   Alert("Loaded row ", row_index + 1, " for editing. Change the form fields, then click Update Row.");
+}
+
+void DeleteSavedRow(const int row_index)
+{
+   if(row_index < 0 || row_index >= g_saved_count)
+      return;
+
+   SnapshotRowsForUndo();
+
+   for(int i = row_index; i < g_saved_count - 1; i++)
+      g_rows[i] = g_rows[i + 1];
+
+   g_saved_count--;
+   ArrayResize(g_rows, g_saved_count);
+
+   if(g_edit_row_index == row_index)
+      g_edit_row_index = -1;
+   else if(g_edit_row_index > row_index)
+      g_edit_row_index--;
+
+   ClampRowsOffsets(g_rows_visible_rows, g_rows_visible_cols);
+   UpdateModeLabel();
+   RebuildPanel();
+   RebuildRowsWindow();
+   Alert("Deleted row ", row_index + 1, ". Use Undo to restore it.");
+}
+
+bool HandleRowsObjectClick(const string obj_name)
+{
+   if(obj_name == Obj("ROWSWIN_BTN_UNDO"))
+   {
+      UndoRowsChange();
+      return true;
+   }
+
+   string edit_prefix = Obj("ROWSWIN_ROW_EDIT_");
+   if(StringFind(obj_name, edit_prefix) == 0)
+   {
+      int row_index = (int)StringToInteger(StringSubstr(obj_name, StringLen(edit_prefix)));
+      StartEditSavedRow(row_index);
+      return true;
+   }
+
+   string del_prefix = Obj("ROWSWIN_ROW_DELETE_");
+   if(StringFind(obj_name, del_prefix) == 0)
+   {
+      int row_index = (int)StringToInteger(StringSubstr(obj_name, StringLen(del_prefix)));
+      DeleteSavedRow(row_index);
+      return true;
+   }
+
+   return false;
 }
 
 //----------------------------- Rows floating window ----------------
@@ -1430,7 +1589,8 @@ void CreateRowsWindow()
 
    MakeButton("ROWSWIN_BTN_EXPORT", x + 10,  y + 34, 100, 22, "Export CSV");
    MakeButton("ROWSWIN_BTN_NEW",    x + 115, y + 34, 90,  22, "New File");
-   MakeLabel("ROWSWIN_COUNT",       x + 215, y + 38, w - 225,
+   MakeButton("ROWSWIN_BTN_UNDO",   x + 210, y + 34, 74,  22, "Undo");
+   MakeLabel("ROWSWIN_COUNT",       x + 294, y + 38, w - 304,
              "Rows: " + IntegerToString(g_saved_count), clrBlack);
 
    int scroll_size = 15;
@@ -1461,8 +1621,11 @@ void CreateRowsWindow()
 
    ClampRowsOffsets(visible_rows, visible_cols);
 
+   int edit_w = 24;
+   int del_w = 24;
    int col0_w = 42;
-   int cell_w = (table_w - col0_w) / visible_cols;
+   int left_w = edit_w + del_w + col0_w;
+   int cell_w = (table_w - left_w) / visible_cols;
    if(cell_w < 60)
       cell_w = 60;
 
@@ -1471,7 +1634,9 @@ void CreateRowsWindow()
    g_rows_table_w = table_w;
    g_rows_table_h = table_h;
 
-   MakeCell("ROWSWIN_CELL_H0", table_x, table_y, col0_w, cell_h, "#", true);
+   MakeCell("ROWSWIN_CELL_HE", table_x, table_y, edit_w, cell_h, "E", true);
+   MakeCell("ROWSWIN_CELL_HD", table_x + edit_w, table_y, del_w, cell_h, "X", true);
+   MakeCell("ROWSWIN_CELL_H0", table_x + edit_w + del_w, table_y, col0_w, cell_h, "#", true);
 
    for(int c = 0; c < visible_cols; c++)
    {
@@ -1483,7 +1648,7 @@ void CreateRowsWindow()
       header = ShortCellText(header, cell_w);
 
       MakeCell("ROWSWIN_CELL_H" + IntegerToString(c + 1),
-               table_x + col0_w + c * cell_w,
+               table_x + left_w + c * cell_w,
                table_y,
                cell_w,
                cell_h,
@@ -1499,8 +1664,22 @@ void CreateRowsWindow()
 
       int yy = table_y + cell_h * (r + 1);
 
+      MakeButton("ROWSWIN_ROW_EDIT_" + IntegerToString(row_idx),
+                 table_x,
+                 yy + 1,
+                 edit_w - 2,
+                 cell_h - 2,
+                 "E");
+
+      MakeButton("ROWSWIN_ROW_DELETE_" + IntegerToString(row_idx),
+                 table_x + edit_w,
+                 yy + 1,
+                 del_w - 2,
+                 cell_h - 2,
+                 "X");
+
       MakeCell("ROWSWIN_CELL_R" + IntegerToString(r) + "_N",
-               table_x,
+               table_x + edit_w + del_w,
                yy,
                col0_w,
                cell_h,
@@ -1517,7 +1696,7 @@ void CreateRowsWindow()
          value = ShortCellText(value, cell_w);
 
          MakeCell("ROWSWIN_CELL_R" + IntegerToString(r) + "_C" + IntegerToString(c),
-                  table_x + col0_w + c * cell_w,
+                  table_x + left_w + c * cell_w,
                   yy,
                   cell_w,
                   cell_h,
@@ -1544,9 +1723,9 @@ void CreateRowsWindow()
             g_rows_vthumb_w, g_rows_vthumb_h, C'185,185,185', clrGray);
 
    // Horizontal scrollbar.
-   g_rows_htrack_x = table_x + col0_w;
+   g_rows_htrack_x = table_x + left_w;
    g_rows_htrack_y = table_y + table_h + 2;
-   g_rows_htrack_w = table_w - col0_w;
+   g_rows_htrack_w = table_w - left_w;
    g_rows_htrack_h = scroll_size - 2;
 
    int max_col = MathMax(0, total_cols - visible_cols);
@@ -1564,7 +1743,7 @@ void CreateRowsWindow()
              x + 10,
              y + h - 24,
              w - 20,
-             "Mouse wheel: rows | Drag scrollbars: rows/columns | Arrow keys scroll | Drag title bar to move"
+             "E=edit row | X=delete row | Undo restores last edit/delete | Drag scrollbars: rows/columns"
              + " | Row "
              + IntegerToString(g_saved_count == 0 ? 0 : g_row_offset + 1)
              + "/"
@@ -1854,7 +2033,10 @@ void UpdateModeLabel()
       txt = "Mode: SELECT BROKEN SWING";
 
    SetLabelText("MODE", txt);
-   SetLabelText("STATUS", "Saved rows: " + IntegerToString(g_saved_count));
+   string status_text = "Saved rows: " + IntegerToString(g_saved_count);
+   if(g_edit_row_index >= 0)
+      status_text += " | Editing row " + IntegerToString(g_edit_row_index + 1);
+   SetLabelText("STATUS", status_text);
    SetLabelText("ROW_COUNT", "Rows: " + IntegerToString(g_saved_count));
    SetLabelText("ROWSWIN_COUNT", "Rows: " + IntegerToString(g_saved_count));
 }
@@ -2466,6 +2648,28 @@ string BuildEventRow()
 
 void SaveCurrentEvent()
 {
+   if(g_edit_row_index >= 0)
+   {
+      if(g_edit_row_index >= g_saved_count)
+      {
+         Alert("The row being edited no longer exists.");
+         g_edit_row_index = -1;
+         RebuildPanel();
+         return;
+      }
+
+      SnapshotRowsForUndo();
+      g_rows[g_edit_row_index] = BuildEditedRowFromOriginal(g_rows[g_edit_row_index]);
+      Alert("Updated row ", g_edit_row_index + 1, ". Use Undo to restore the previous row.");
+      g_edit_row_index = -1;
+
+      UpdateModeLabel();
+      RebuildPanel();
+      if(g_rows_window_visible)
+         RebuildRowsWindow();
+      return;
+   }
+
    if(!g_has_bo)
    {
       Alert("Select a breakout candle first.");
@@ -2624,6 +2828,9 @@ void NewFile()
 
    ArrayResize(g_rows, 0);
    g_saved_count = 0;
+   g_edit_row_index = -1;
+   g_undo_available = false;
+   ArrayResize(g_undo_rows, 0);
    g_row_offset = 0;
    g_col_offset = 0;
 
@@ -2653,6 +2860,9 @@ void HandleObjectClick(const string obj_name)
    SetChartMouseScrollState(false);
 
    if(HandlePickerObjectClick(obj_name))
+      return;
+
+   if(HandleRowsObjectClick(obj_name))
       return;
 
    string short_name = obj_name;
