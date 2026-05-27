@@ -111,6 +111,17 @@ enum RowsDragKind
    ROWS_DRAG_HSCROLL
 };
 
+enum PickerSection
+{
+   PICKER_NONE = 0,
+   PICKER_MARKET_CONDITION,
+   PICKER_PATTERN,
+   PICKER_BREAKOUT_OF_WHAT,
+   PICKER_HTF_LOCATION,
+   PICKER_AT_LEG,
+   PICKER_MARKET_DIRECTION
+};
+
 SelectMode g_mode = MODE_NONE;
 PanelTab   g_tab  = TAB_FORM;
 int        g_leg_click_step = 0;
@@ -152,6 +163,13 @@ int  g_rows_hthumb_h = 0;
 
 bool g_chart_mouse_scroll_initial = true;
 bool g_chart_mouse_scroll_current = true;
+
+PickerSection g_picker_section = PICKER_NONE;
+bool          g_picker_visible = false;
+int           g_picker_x = 0;
+int           g_picker_y = 0;
+int           g_picker_w = 390;
+int           g_picker_h = 260;
 
 #define KEY_PGUP   33
 #define KEY_PGDN   34
@@ -353,6 +371,81 @@ string JoinCsv(const string &fields[])
    return row;
 }
 
+
+string SelectionSeparator()
+{
+   return "; ";
+}
+
+bool SelectionContains(const string list, const string item)
+{
+   string parts[];
+   int n = StringSplit(list, ';', parts);
+   for(int i = 0; i < n; i++)
+   {
+      string token = Trim(parts[i]);
+      if(token == item)
+         return true;
+   }
+   return false;
+}
+
+string SelectionAdd(const string list, const string item)
+{
+   string clean = Trim(list);
+   if(clean == "")
+      return item;
+   if(SelectionContains(clean, item))
+      return clean;
+   return clean + SelectionSeparator() + item;
+}
+
+string SelectionRemove(const string list, const string item)
+{
+   string parts[];
+   int n = StringSplit(list, ';', parts);
+   string out = "";
+   for(int i = 0; i < n; i++)
+   {
+      string token = Trim(parts[i]);
+      if(token == "" || token == item)
+         continue;
+      if(out != "")
+         out += SelectionSeparator();
+      out += token;
+   }
+   return out;
+}
+
+string SelectionToggle(const string list, const string item)
+{
+   if(SelectionContains(list, item))
+      return SelectionRemove(list, item);
+   return SelectionAdd(list, item);
+}
+
+string SummaryText(const string value)
+{
+   string s = Trim(value);
+   if(s == "")
+      return "None";
+   if(StringLen(s) > 46)
+      return StringSubstr(s, 0, 43) + "...";
+   return s;
+}
+
+string BreakoutOfWhatForCsv()
+{
+   string result = g_break_out_of_what;
+   if(SelectionContains(result, "same as pattern"))
+   {
+      result = SelectionRemove(result, "same as pattern");
+      if(g_pattern != "")
+         result = SelectionAdd(result, g_pattern);
+   }
+   return result;
+}
+
 string GetEdit(const string name)
 {
    string obj = Obj(name);
@@ -463,7 +556,8 @@ void UpdateChartMouseScrollProtection(const int px, const int py, const bool lef
       over_rows_window = PointInRect(px, py, g_rows_window_x, g_rows_window_y,
                                      InpRowsWindowWidth, InpRowsWindowHeight);
 
-   bool over_ui = MainPanelHitXY(px, py) || over_rows_window || g_rows_drag_kind != ROWS_DRAG_NONE;
+   bool over_picker = PickerWindowHit(px, py);
+   bool over_ui = MainPanelHitXY(px, py) || over_rows_window || over_picker || g_rows_drag_kind != ROWS_DRAG_NONE;
 
    if(over_ui || (left_down && g_rows_drag_kind != ROWS_DRAG_NONE))
       SetChartMouseScrollState(false);
@@ -746,26 +840,291 @@ void SaveFormState()
 {
    if(ObjectFind(0, Obj("FORM_EDIT_EXPORT_NAME")) >= 0)
       g_export_name = GetEdit("FORM_EDIT_EXPORT_NAME");
-   if(ObjectFind(0, Obj("FORM_EDIT_BREAK_OUT_OF_WHAT")) >= 0)
-      g_break_out_of_what = GetEdit("FORM_EDIT_BREAK_OUT_OF_WHAT");
-   if(ObjectFind(0, Obj("FORM_EDIT_PATTERN")) >= 0)
-      g_pattern = GetEdit("FORM_EDIT_PATTERN");
-   if(ObjectFind(0, Obj("FORM_EDIT_FROM_PULLBACK")) >= 0)
-      g_from_pullback = GetEdit("FORM_EDIT_FROM_PULLBACK");
-   if(ObjectFind(0, Obj("FORM_EDIT_AT_LEG")) >= 0)
-      g_at_leg = GetEdit("FORM_EDIT_AT_LEG");
-   if(ObjectFind(0, Obj("FORM_EDIT_HTF_LOCATION")) >= 0)
-      g_htf_location = GetEdit("FORM_EDIT_HTF_LOCATION");
-   if(ObjectFind(0, Obj("FORM_EDIT_MARKET_CONDITION")) >= 0)
-      g_market_condition = GetEdit("FORM_EDIT_MARKET_CONDITION");
-   if(ObjectFind(0, Obj("FORM_EDIT_MARKET_DIRECTION")) >= 0)
-      g_market_direction = GetEdit("FORM_EDIT_MARKET_DIRECTION");
-   if(ObjectFind(0, Obj("FORM_EDIT_FT_BEFORE_PB")) >= 0)
-      g_ft_before_pb = GetEdit("FORM_EDIT_FT_BEFORE_PB");
    if(ObjectFind(0, Obj("FORM_EDIT_SCREENSHOT")) >= 0)
       g_screenshot_path = GetEdit("FORM_EDIT_SCREENSHOT");
    if(ObjectFind(0, Obj("FORM_EDIT_NOTE")) >= 0)
       g_note = GetEdit("FORM_EDIT_NOTE");
+}
+
+
+PickerSection PickerSectionFromButtonName(const string short_name)
+{
+   if(short_name == "FORM_PICK_MARKET_CONDITION") return PICKER_MARKET_CONDITION;
+   if(short_name == "FORM_PICK_PATTERN")          return PICKER_PATTERN;
+   if(short_name == "FORM_PICK_BREAKOUT_OF_WHAT") return PICKER_BREAKOUT_OF_WHAT;
+   if(short_name == "FORM_PICK_HTF_LOCATION")     return PICKER_HTF_LOCATION;
+   if(short_name == "FORM_PICK_AT_LEG")           return PICKER_AT_LEG;
+   if(short_name == "FORM_PICK_MARKET_DIRECTION") return PICKER_MARKET_DIRECTION;
+   return PICKER_NONE;
+}
+
+string PickerTitle(const PickerSection section)
+{
+   if(section == PICKER_MARKET_CONDITION) return "Market condition";
+   if(section == PICKER_PATTERN)          return "Pattern";
+   if(section == PICKER_BREAKOUT_OF_WHAT) return "Break out of what";
+   if(section == PICKER_HTF_LOCATION)     return "HTF location";
+   if(section == PICKER_AT_LEG)           return "At what leg";
+   if(section == PICKER_MARKET_DIRECTION) return "Market direction";
+   return "Picker";
+}
+
+string PickerValue(const PickerSection section)
+{
+   if(section == PICKER_MARKET_CONDITION) return g_market_condition;
+   if(section == PICKER_PATTERN)          return g_pattern;
+   if(section == PICKER_BREAKOUT_OF_WHAT) return g_break_out_of_what;
+   if(section == PICKER_HTF_LOCATION)     return g_htf_location;
+   if(section == PICKER_AT_LEG)           return g_at_leg;
+   if(section == PICKER_MARKET_DIRECTION) return g_market_direction;
+   return "";
+}
+
+void SetPickerValue(const PickerSection section, const string value)
+{
+   if(section == PICKER_MARKET_CONDITION) g_market_condition = value;
+   else if(section == PICKER_PATTERN) g_pattern = value;
+   else if(section == PICKER_BREAKOUT_OF_WHAT) g_break_out_of_what = value;
+   else if(section == PICKER_HTF_LOCATION) g_htf_location = value;
+   else if(section == PICKER_AT_LEG) g_at_leg = value;
+   else if(section == PICKER_MARKET_DIRECTION) g_market_direction = value;
+}
+
+void PickerOptions(const PickerSection section, string &options[])
+{
+   ArrayResize(options, 0);
+
+   if(section == PICKER_MARKET_CONDITION)
+   {
+      ArrayResize(options, 5);
+      options[0] = "break out BO";
+      options[1] = "tight channel TC";
+      options[2] = "channel C";
+      options[3] = "trading range R";
+      options[4] = "tight trading range TR";
+      return;
+   }
+
+   if(section == PICKER_PATTERN)
+   {
+      ArrayResize(options, 19);
+      options[0] = "wedge upside";
+      options[1] = "wedge downside";
+      options[2] = "triangle";
+      options[3] = "expanding triangle";
+      options[4] = "MTR";
+      options[5] = "double top";
+      options[6] = "micro double top";
+      options[7] = "double bottom";
+      options[8] = "micro double bottom";
+      options[9] = "final flag";
+      options[10] = "bull flag";
+      options[11] = "bear flag";
+      options[12] = "tight range";
+      options[13] = "pb";
+      options[14] = "f2es";
+      options[15] = "f2el";
+      options[16] = "h2";
+      options[17] = "l2";
+      options[18] = "2nd leg pb";
+      return;
+   }
+
+   if(section == PICKER_BREAKOUT_OF_WHAT)
+   {
+      ArrayResize(options, 10);
+      options[0] = "BO";
+      options[1] = "i";
+      options[2] = "ii";
+      options[3] = "ioi";
+      options[4] = "swing high";
+      options[5] = "swing low";
+      options[6] = "round number";
+      options[7] = "valid zone";
+      options[8] = "ema 20";
+      options[9] = "same as pattern";
+      return;
+   }
+
+   if(section == PICKER_HTF_LOCATION)
+   {
+      ArrayResize(options, 3);
+      options[0] = "high";
+      options[1] = "mid";
+      options[2] = "low";
+      return;
+   }
+
+   if(section == PICKER_AT_LEG)
+   {
+      ArrayResize(options, 4);
+      options[0] = "1";
+      options[1] = "2";
+      options[2] = "3";
+      options[3] = "4+";
+      return;
+   }
+
+   if(section == PICKER_MARKET_DIRECTION)
+   {
+      ArrayResize(options, 3);
+      options[0] = "up";
+      options[1] = "down";
+      options[2] = "neutral";
+      return;
+   }
+}
+
+bool PickerIsSingleChoice(const PickerSection section)
+{
+   return (section == PICKER_HTF_LOCATION || section == PICKER_AT_LEG || section == PICKER_MARKET_DIRECTION);
+}
+
+void DeletePickerObjects()
+{
+   DeleteObjectsContaining("PICKER_");
+}
+
+void UpdateFormSummaries()
+{
+   SetLabelText("FORM_SUMMARY_BREAKOUT_OF_WHAT", SummaryText(BreakoutOfWhatForCsv()));
+   SetLabelText("FORM_SUMMARY_PATTERN", SummaryText(g_pattern));
+   SetLabelText("FORM_SUMMARY_AT_LEG", SummaryText(g_at_leg));
+   SetLabelText("FORM_SUMMARY_HTF_LOCATION", SummaryText(g_htf_location));
+   SetLabelText("FORM_SUMMARY_MARKET_CONDITION", SummaryText(g_market_condition));
+   SetLabelText("FORM_SUMMARY_MARKET_DIRECTION", SummaryText(g_market_direction));
+}
+
+void MakePickerRow(const PickerSection section, const int opt_index, const string text,
+                   const int x, const int y, const int w, const int h)
+{
+   string selected = SelectionContains(PickerValue(section), text) ? "[x] " : "[ ] ";
+   MakeButton("PICKER_OPT_" + IntegerToString(opt_index), x, y, w, h, selected + text);
+}
+
+void CreatePickerWindow(const PickerSection section)
+{
+   DeletePickerObjects();
+   if(section == PICKER_NONE)
+      return;
+
+   g_picker_section = section;
+   g_picker_visible = true;
+
+   g_picker_x = InpPanelX + InpPanelWidth + 15;
+   g_picker_y = InpPanelY;
+   g_picker_w = 430;
+
+   string opts[];
+   PickerOptions(section, opts);
+   int count = ArraySize(opts);
+   int cols = (count > 10 ? 2 : 1);
+   int row_h = 24;
+   int rows = (count + cols - 1) / cols;
+   g_picker_h = 72 + rows * row_h + 34;
+   if(g_picker_h < 170)
+      g_picker_h = 170;
+
+   MakeRect("PICKER_BG", g_picker_x, g_picker_y, g_picker_w, g_picker_h, InpPanelBgColor, InpPanelBorderColor);
+   MakeRect("PICKER_TITLE_BG", g_picker_x, g_picker_y, g_picker_w, 28, C'230,230,230', InpPanelBorderColor);
+   MakeLabel("PICKER_TITLE", g_picker_x + 10, g_picker_y + 7, g_picker_w - 90, PickerTitle(section), clrBlack);
+   MakeButton("PICKER_BTN_CLOSE", g_picker_x + g_picker_w - 32, g_picker_y + 4, 22, 20, "X");
+   MakeButton("PICKER_BTN_CLEAR", g_picker_x + 10, g_picker_y + 36, 80, 22, "Clear");
+   MakeButton("PICKER_BTN_DONE", g_picker_x + 95, g_picker_y + 36, 80, 22, "Done");
+
+   string help = PickerIsSingleChoice(section) ? "Choose one option." : "Choose one or more options.";
+   if(section == PICKER_BREAKOUT_OF_WHAT)
+      help = "same as pattern copies selected Pattern values into this CSV column.";
+   MakeLabel("PICKER_HELP", g_picker_x + 185, g_picker_y + 40, g_picker_w - 195, help, clrDimGray);
+
+   int margin = 10;
+   int top = g_picker_y + 68;
+   int col_w = (g_picker_w - margin * (cols + 1)) / cols;
+
+   for(int i = 0; i < count; i++)
+   {
+      int col = i / rows;
+      int row = i % rows;
+      int bx = g_picker_x + margin + col * (col_w + margin);
+      int by = top + row * row_h;
+      MakePickerRow(section, i, opts[i], bx, by, col_w, 21);
+   }
+
+   ChartRedraw(0);
+}
+
+void ClosePickerWindow()
+{
+   g_picker_visible = false;
+   g_picker_section = PICKER_NONE;
+   DeletePickerObjects();
+   UpdateFormSummaries();
+   ChartRedraw(0);
+}
+
+bool PickerWindowHit(const int px, const int py)
+{
+   if(!g_picker_visible)
+      return false;
+   return PointInRect(px, py, g_picker_x, g_picker_y, g_picker_w, g_picker_h);
+}
+
+void TogglePickerOption(const int opt_index)
+{
+   if(g_picker_section == PICKER_NONE)
+      return;
+
+   string opts[];
+   PickerOptions(g_picker_section, opts);
+   if(opt_index < 0 || opt_index >= ArraySize(opts))
+      return;
+
+   string item = opts[opt_index];
+   string value = PickerValue(g_picker_section);
+   if(PickerIsSingleChoice(g_picker_section))
+   {
+      if(SelectionContains(value, item))
+         value = "";
+      else
+         value = item;
+   }
+   else
+      value = SelectionToggle(value, item);
+
+   SetPickerValue(g_picker_section, value);
+   CreatePickerWindow(g_picker_section);
+   UpdateFormSummaries();
+}
+
+bool HandlePickerObjectClick(const string obj_name)
+{
+   string prefix = Obj("PICKER_");
+   if(StringFind(obj_name, prefix) != 0)
+      return false;
+
+   if(obj_name == Obj("PICKER_BTN_CLOSE") || obj_name == Obj("PICKER_BTN_DONE"))
+   {
+      ClosePickerWindow();
+      return true;
+   }
+
+   if(obj_name == Obj("PICKER_BTN_CLEAR"))
+   {
+      SetPickerValue(g_picker_section, "");
+      CreatePickerWindow(g_picker_section);
+      UpdateFormSummaries();
+      return true;
+   }
+
+   string opt_prefix = Obj("PICKER_OPT_");
+   if(StringFind(obj_name, opt_prefix) == 0)
+   {
+      int opt_index = (int)StringToInteger(StringSubstr(obj_name, StringLen(opt_prefix)));
+      TogglePickerOption(opt_index);
+      return true;
+   }
+
+   return true;
 }
 
 void ClearDynamicPanelObjects()
@@ -796,6 +1155,16 @@ void CreatePanelBase()
    MakeLabel("STATUS",x + 10,  y + 60, w - 20, "Saved rows: 0", clrDimGray);
 }
 
+void MakePickerField(const string button_name, const string summary_name,
+                     const int label_x, const int button_x, const int summary_x,
+                     const int y, const int summary_w,
+                     const string label_text, const string summary_text)
+{
+   MakeLabel("FORM_LBL_" + button_name, label_x, y, button_x - label_x - 8, label_text);
+   MakeButton(button_name, button_x, y - 3, 96, 20, "Choose...");
+   MakeLabel(summary_name, summary_x, y, summary_w, SummaryText(summary_text), clrDarkSlateGray);
+}
+
 void CreateFormTab()
 {
    int x = InpPanelX;
@@ -824,52 +1193,55 @@ void CreateFormTab()
    MakeLabel("FORM_LBL_EXPORT", x + 10, by, 140, "Export name");
    MakeEdit("FORM_EDIT_EXPORT_NAME", edit_x, by - 3, edit_w, 20, g_export_name);
 
-   by += 26;
-   MakeLabel("FORM_LBL_WHAT", x + 10, by, 140, "Break out of what");
-   MakeEdit("FORM_EDIT_BREAK_OUT_OF_WHAT", edit_x, by - 3, edit_w, 20, g_break_out_of_what);
+   int label_x = x + 10;
+   int button_x = x + 155;
+   int summary_x = x + 258;
+   int summary_w = InpPanelWidth - 270;
 
-   by += 26;
-   MakeLabel("FORM_LBL_PATTERN", x + 10, by, 140, "Pattern");
-   MakeEdit("FORM_EDIT_PATTERN", edit_x, by - 3, edit_w, 20, g_pattern);
+   by += 30;
+   MakePickerField("FORM_PICK_MARKET_CONDITION", "FORM_SUMMARY_MARKET_CONDITION",
+                   label_x, button_x, summary_x, by, summary_w,
+                   "Market condition", g_market_condition);
 
-   by += 26;
-   MakeLabel("FORM_LBL_PB", x + 10, by, 140, "BO from pullback");
-   MakeEdit("FORM_EDIT_FROM_PULLBACK", edit_x, by - 3, edit_w, 20, g_from_pullback);
+   by += 28;
+   MakePickerField("FORM_PICK_PATTERN", "FORM_SUMMARY_PATTERN",
+                   label_x, button_x, summary_x, by, summary_w,
+                   "Pattern", g_pattern);
 
-   by += 26;
-   MakeLabel("FORM_LBL_LEGCOUNT", x + 10, by, 140, "At what leg");
-   MakeEdit("FORM_EDIT_AT_LEG", edit_x, by - 3, edit_w, 20, g_at_leg);
+   by += 28;
+   MakePickerField("FORM_PICK_BREAKOUT_OF_WHAT", "FORM_SUMMARY_BREAKOUT_OF_WHAT",
+                   label_x, button_x, summary_x, by, summary_w,
+                   "Break out of what", BreakoutOfWhatForCsv());
 
-   by += 26;
-   MakeLabel("FORM_LBL_HTF", x + 10, by, 140, "HTF location");
-   MakeEdit("FORM_EDIT_HTF_LOCATION", edit_x, by - 3, edit_w, 20, g_htf_location);
+   by += 28;
+   MakePickerField("FORM_PICK_HTF_LOCATION", "FORM_SUMMARY_HTF_LOCATION",
+                   label_x, button_x, summary_x, by, summary_w,
+                   "HTF location", g_htf_location);
 
-   by += 26;
-   MakeLabel("FORM_LBL_CONDITION", x + 10, by, 140, "Market condition");
-   MakeEdit("FORM_EDIT_MARKET_CONDITION", edit_x, by - 3, edit_w, 20, g_market_condition);
+   by += 28;
+   MakePickerField("FORM_PICK_AT_LEG", "FORM_SUMMARY_AT_LEG",
+                   label_x, button_x, summary_x, by, summary_w,
+                   "At what leg", g_at_leg);
 
-   by += 26;
-   MakeLabel("FORM_LBL_DIRECTION", x + 10, by, 140, "Market direction");
-   MakeEdit("FORM_EDIT_MARKET_DIRECTION", edit_x, by - 3, edit_w, 20, g_market_direction);
+   by += 28;
+   MakePickerField("FORM_PICK_MARKET_DIRECTION", "FORM_SUMMARY_MARKET_DIRECTION",
+                   label_x, button_x, summary_x, by, summary_w,
+                   "Market direction", g_market_direction);
 
-   by += 26;
-   MakeLabel("FORM_LBL_FTCOUNT", x + 10, by, 140, "# FT before first PB");
-   MakeEdit("FORM_EDIT_FT_BEFORE_PB", edit_x, by - 3, edit_w, 20, g_ft_before_pb);
-
-   by += 26;
+   by += 32;
    MakeLabel("FORM_LBL_SCREEN", x + 10, by, 140, "Screenshot path");
    MakeEdit("FORM_EDIT_SCREENSHOT", edit_x, by - 3, edit_w, 20, g_screenshot_path);
 
    by += 26;
    MakeLabel("FORM_LBL_NOTE", x + 10, by, 140, "Note");
-   MakeEdit("FORM_EDIT_NOTE", edit_x, by - 3, edit_w, 42, g_note);
+   MakeEdit("FORM_EDIT_NOTE", edit_x, by - 3, edit_w, 68, g_note);
 
-   by += 54;
+   by += 82;
    MakeLabel("FORM_HELP1", x + 10, by, InpPanelWidth - 20,
-             "Click modes: B=BO, F=FT, P=breakout price, L=leg start/end/PB end, S=swing.", clrDimGray);
+             "Click Choose... to open checkbox panels. Pattern and market condition allow multiple choices.", clrDimGray);
    by += 16;
    MakeLabel("FORM_HELP2", x + 10, by, InpPanelWidth - 20,
-             "Open Rows shows a separate draggable table window with scrollbars.", clrDimGray);
+             "BO from pullback and FT before first PB were removed from the visible input form.", clrDimGray);
 }
 
 string FieldAtCsvIndex(const string row, int wanted)
@@ -1660,6 +2032,13 @@ void ClearSelections()
    g_pb_end_index = -1;
    g_swing_index = -1;
 
+   g_bo_time = 0;
+   g_ft_time = 0;
+   g_leg_start_time = 0;
+   g_leg_end_time = 0;
+   g_pb_end_time = 0;
+   g_swing_time = 0;
+
    g_bo_point = 0.0;
    g_leg_start_price = 0.0;
    g_leg_end_price = 0.0;
@@ -2045,16 +2424,16 @@ string BuildEventRow()
    f[k++] = g_has_ft ? Dbl(CandleRangeInATR(g_ft_index), 5) : "";
    f[k++] = Dbl(gap_ft_before_bo, 2);
    f[k++] = Dbl(gap_ft_bo_point, 2);
-   f[k++] = g_ft_before_pb;
+   f[k++] = "";
 
    f[k++] = g_has_bo_point ? Dbl(g_bo_point, _Digits) : "";
    f[k++] = g_has_leg ? Dbl(g_leg_start_price, _Digits) : "";
    f[k++] = g_has_leg ? Dbl(g_leg_end_price, _Digits) : "";
    f[k++] = g_has_leg ? Dbl(g_pb_end_price, _Digits) : "";
 
-   f[k++] = g_break_out_of_what;
+   f[k++] = BreakoutOfWhatForCsv();
    f[k++] = g_pattern;
-   f[k++] = g_from_pullback;
+   f[k++] = "";
    f[k++] = g_at_leg;
    f[k++] = g_has_swing ? IntegerToString(g_swing_period) : "";
    f[k++] = g_htf_location;
@@ -2080,7 +2459,7 @@ string BuildEventRow()
    f[k++] = g_screenshot_path;
    f[k++] = IntegerToString(InpEMA20SlopeLookback);
    f[k++] = Dbl(pip, _Digits);
-   f[k++] = "1.3";
+   f[k++] = "1.4";
 
    return JoinCsv(f);
 }
@@ -2220,26 +2599,13 @@ void ResetFormStateForNewFile(const string new_export_name)
 
    if(ObjectFind(0, Obj("FORM_EDIT_EXPORT_NAME")) >= 0)
       ObjectSetString(0, Obj("FORM_EDIT_EXPORT_NAME"), OBJPROP_TEXT, g_export_name);
-   if(ObjectFind(0, Obj("FORM_EDIT_BREAK_OUT_OF_WHAT")) >= 0)
-      ObjectSetString(0, Obj("FORM_EDIT_BREAK_OUT_OF_WHAT"), OBJPROP_TEXT, g_break_out_of_what);
-   if(ObjectFind(0, Obj("FORM_EDIT_PATTERN")) >= 0)
-      ObjectSetString(0, Obj("FORM_EDIT_PATTERN"), OBJPROP_TEXT, g_pattern);
-   if(ObjectFind(0, Obj("FORM_EDIT_FROM_PULLBACK")) >= 0)
-      ObjectSetString(0, Obj("FORM_EDIT_FROM_PULLBACK"), OBJPROP_TEXT, g_from_pullback);
-   if(ObjectFind(0, Obj("FORM_EDIT_AT_LEG")) >= 0)
-      ObjectSetString(0, Obj("FORM_EDIT_AT_LEG"), OBJPROP_TEXT, g_at_leg);
-   if(ObjectFind(0, Obj("FORM_EDIT_HTF_LOCATION")) >= 0)
-      ObjectSetString(0, Obj("FORM_EDIT_HTF_LOCATION"), OBJPROP_TEXT, g_htf_location);
-   if(ObjectFind(0, Obj("FORM_EDIT_MARKET_CONDITION")) >= 0)
-      ObjectSetString(0, Obj("FORM_EDIT_MARKET_CONDITION"), OBJPROP_TEXT, g_market_condition);
-   if(ObjectFind(0, Obj("FORM_EDIT_MARKET_DIRECTION")) >= 0)
-      ObjectSetString(0, Obj("FORM_EDIT_MARKET_DIRECTION"), OBJPROP_TEXT, g_market_direction);
-   if(ObjectFind(0, Obj("FORM_EDIT_FT_BEFORE_PB")) >= 0)
-      ObjectSetString(0, Obj("FORM_EDIT_FT_BEFORE_PB"), OBJPROP_TEXT, g_ft_before_pb);
    if(ObjectFind(0, Obj("FORM_EDIT_SCREENSHOT")) >= 0)
       ObjectSetString(0, Obj("FORM_EDIT_SCREENSHOT"), OBJPROP_TEXT, g_screenshot_path);
    if(ObjectFind(0, Obj("FORM_EDIT_NOTE")) >= 0)
       ObjectSetString(0, Obj("FORM_EDIT_NOTE"), OBJPROP_TEXT, g_note);
+
+   UpdateFormSummaries();
+   ClosePickerWindow();
 }
 
 void NewFile()
@@ -2285,6 +2651,21 @@ void HandleObjectClick(const string obj_name)
    g_ignore_next_chart_click = true;
    ResetButtonState(obj_name);
    SetChartMouseScrollState(false);
+
+   if(HandlePickerObjectClick(obj_name))
+      return;
+
+   string short_name = obj_name;
+   if(StringFind(short_name, PREFIX) == 0)
+      short_name = StringSubstr(short_name, StringLen(PREFIX));
+
+   PickerSection pick_section = PickerSectionFromButtonName(short_name);
+   if(pick_section != PICKER_NONE)
+   {
+      SaveFormState();
+      CreatePickerWindow(pick_section);
+      return;
+   }
 
    if(obj_name == Obj("BTN_CLOSE"))
       CloseIndicatorFromButton();
@@ -2399,6 +2780,9 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       }
 
       if(HandleRowsWindowClick(lparam, dparam))
+         return;
+
+      if(PickerWindowHit(g_last_mouse_x, g_last_mouse_y))
          return;
 
       if(ClickInsidePanel(lparam, dparam))
